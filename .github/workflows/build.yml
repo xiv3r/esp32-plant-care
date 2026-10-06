@@ -32,6 +32,8 @@ jobs:
         
         # Install libraries
         arduino-cli lib install "DHT22"
+        arduino-cli lib install "AsyncTCP"
+        arduino-cli lib install "ESPAsyncWebServer"
         
         # Compile firmware
         mv *.ino esp32-plant-care.ino
