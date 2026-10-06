@@ -71,8 +71,9 @@ static char jsonBuf[512];
 static char bodyBuf[512];
 static char nvsNs[]  = "irrig";
 
-static volatile uint32_t settingsLockUntil = 0;
-static const uint32_t SETTINGS_LOCK_MS = 5000;
+static volatile bool settingsSaveInFlight = false;
+static volatile uint32_t settingsSaveStartedAt = 0;
+static const uint32_t SETTINGS_SAVE_TIMEOUT_MS = 5000;
 
 // ============================================================
 // SETTINGS LOAD / SAVE (NVS)
@@ -213,9 +214,12 @@ button:hover{filter:brightness(1.1)}
 <div class="footer" id="footer">—</div>
 <script>
 function q(id){return document.getElementById(id)}
+let saving=false;
 async function refresh(){
+  if(saving)return;
   try{
-    const r=await fetch('/api/status');const d=await r.json();
+    const r=await fetch('/api/status?_='+Date.now());
+    const d=await r.json();
     q('soil').textContent=d.soil;
     q('soil').className='value '+(d.soilOk?(d.soil>d.soilDry+d.soilHyst?'warn':'ok'):'off');
     q('temp').textContent=d.temp.toFixed(1)+'°C';
@@ -224,8 +228,10 @@ async function refresh(){
     q('motor').className='value '+(d.motor?'warn':'ok');
     q('footer').textContent='Uptime '+d.uptime+'s · Heap '+d.heap+'B';
     if(!q('cfg').dataset.touched){
-      q('soilDry').value=d.soilDry;q('soilHyst').value=d.soilHyst;
-      q('tempLimit').value=d.tempLimit;q('enabled').checked=d.enabled;
+      q('soilDry').value=d.soilDry;
+      q('soilHyst').value=d.soilHyst;
+      q('tempLimit').value=d.tempLimit;
+      q('enabled').checked=d.enabled;
     }
   }catch(e){q('footer').textContent='disconnected'}
 }
@@ -233,15 +239,31 @@ document.querySelectorAll('#cfg input').forEach(i=>i.addEventListener('input',
   ()=>q('cfg').dataset.touched='1'));
 q('cfg').addEventListener('submit',async e=>{
   e.preventDefault();
+  if(saving)return;
+  saving=true;
   const body=new URLSearchParams({
-    soilDry:q('soilDry').value,soilHyst:q('soilHyst').value,
-    tempLimit:q('tempLimit').value,enabled:q('enabled').checked?'1':'0'
+    soilDry:q('soilDry').value,
+    soilHyst:q('soilHyst').value,
+    tempLimit:q('tempLimit').value,
+    enabled:q('enabled').checked?'1':'0'
   });
-  await fetch('/api/settings',{method:'POST',body});
-  q('cfg').dataset.touched='';
-  refresh();
+  try{
+    const r=await fetch('/api/settings',{method:'POST',body});
+    if(!r.ok){
+      q('footer').textContent='save failed ('+r.status+')';
+      return;
+    }
+    q('cfg').dataset.touched='';
+    await refresh();
+    q('footer').textContent='saved';
+  }catch(err){
+    q('footer').textContent='save failed (network)';
+  }finally{
+    saving=false;
+  }
 });
-setInterval(refresh,2000);refresh();
+setInterval(refresh,2000);
+refresh();
 </script></body></html>
 )HTML";
 
@@ -254,7 +276,9 @@ void handleRoot(AsyncWebServerRequest *req)
 }
 void handleStatus(AsyncWebServerRequest *req)
 {
-  req->send(200, "application/json", buildStatusJson());
+  AsyncWebServerResponse *res = req->beginResponse(200, "application/json", buildStatusJson());
+  res->addHeader("Cache-Control", "no-store");
+  req->send(res);
 }
 void urlDecode(const char* src, char* dst, size_t dstSize)
 {
@@ -298,18 +322,18 @@ bool parseSettings(const char* body, Settings& out)
 }
 void handleSettings(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_t index, size_t total)
 {
-  uint32_t now = millis();
   if (index == 0) {
-    if ((int32_t)(now - settingsLockUntil) < 0) {
+    if (settingsSaveInFlight && (millis() - settingsSaveStartedAt) < SETTINGS_SAVE_TIMEOUT_MS) {
       req->send(429, "application/json", "{\"error\":\"busy\"}");
       return;
     }
-    settingsLockUntil = now + SETTINGS_LOCK_MS;
+    settingsSaveInFlight = true;
+    settingsSaveStartedAt = millis();
     bodyBuf[0] = 0;
   }
   if (index + len >= sizeof(bodyBuf) - 1) {
     if (index + len == total) {
-      settingsLockUntil = 0;
+      settingsSaveInFlight = false;
       req->send(413, "application/json", "{\"error\":\"body too large\"}");
     }
     return;
@@ -327,7 +351,7 @@ void handleSettings(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
     if (newCfg.tempLimit > 60)    newCfg.tempLimit = 60;
     cfg = newCfg;
     saveSettings();
-    settingsLockUntil = 0;
+    settingsSaveInFlight = false;
     req->send(200, "application/json", "{\"ok\":true}");
   }
 }
