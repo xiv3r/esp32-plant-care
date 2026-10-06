@@ -36,7 +36,6 @@ jobs:
         arduino-cli lib install "ESPAsyncWebServer"
         
         # Compile firmware
-        mv *.ino esp32-plant-care.ino
         arduino-cli compile --fqbn esp32:esp32:esp32 --output-dir firmware .
         
         # Rename
