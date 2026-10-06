@@ -34,9 +34,8 @@ jobs:
         arduino-cli lib install "DHT22"
         arduino-cli lib install "DHT sensor library"
         arduino-cli lib install "Adafruit Unified Sensor"
-        arduino-cli lib install "AsyncTCP"
         git clone --depth 1 https://github.com/ESP32Async/ESPAsyncWebServer.git ~/Arduino/libraries/ESPAsyncWebServer
-        # git clone --depth 1 https://github.com/ESP32Async/AsyncTCP.git
+        git clone --depth 1 https://github.com/ESP32Async/AsyncTCP.git ~/Arduino/libraries/AsyncTCP
         
         # Compile firmware
         arduino-cli compile --fqbn esp32:esp32:esp32 --output-dir firmware .
