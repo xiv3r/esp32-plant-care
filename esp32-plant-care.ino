@@ -28,10 +28,9 @@
 // ============================================================
 static const char* WIFI_SSID = "ESP32_Plant_Care";
 static const char* WIFI_PASS = "12345678";
-static IPAddress LOCAL_IP(192, 168, 4, 50);
+static IPAddress LOCAL_IP(192, 168, 4, 1);
 static IPAddress GATEWAY  (192, 168, 4, 1);
 static IPAddress SUBNET   (255, 255, 255, 0);
-static IPAddress DNS1     (192, 168, 4, 1);
 
 // ============================================================
 // RUNTIME SETTINGS
@@ -338,14 +337,9 @@ void handleSettings(AsyncWebServerRequest *req, uint8_t *data, size_t len, size_
 // ============================================================
 void connectWiFi()
 {
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  WiFi.config(LOCAL_IP, GATEWAY, SUBNET, DNS1);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
-    delay(250);
-  }
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(LOCAL_IP, GATEWAY, SUBNET);
+  WiFi.softAP(WIFI_SSID, WIFI_PASS);
 }
 
 // ============================================================
