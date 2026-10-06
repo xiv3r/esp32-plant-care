@@ -7,6 +7,7 @@
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include <DHT.h>
+#include <DNSServer.h>
 
 // -----------------------------
 // Pin definitions
@@ -52,6 +53,7 @@ Config cfg = { 2500, 150, 35.0f, 2500 };
 DHT dht(DHT_PIN, DHT_TYPE);
 WebServer server(80);
 Preferences prefs;
+DNSServer dnsServer;
 
 bool     motorStatus  = false;
 int      lastSoil     = -1;         
@@ -253,6 +255,8 @@ void sampleSensors() {
 // HTTP handlers
 // -----------------------------
 void handleRoot() {
+  server.sendHeader(F("Captive-Portal"), F("http://192.168.4.1/"));
+  server.sendHeader(F("Cache-Control"),   F("no-cache"));
   server.send_P(200, PSTR("text/html"), INDEX_HTML);
 }
 
@@ -356,6 +360,11 @@ void handleFavicon() {
   server.send(204, F("text/plain"), "");
 }
 
+void handlePortalRedirect() {
+  server.sendHeader(F("Location"), F("/"), true);
+  server.send(302, F("text/plain"), "");
+}
+
 // -----------------------------
 // WiFi AP
 // -----------------------------
@@ -364,6 +373,7 @@ void wifiInit() {
   WiFi.softAP(AP_SSID, AP_PASSWORD);
   apMode = true;
   MDNS.begin("plant");
+  dnsServer.start(53, "*", WiFi.softAPIP());
 }
 
 // -----------------------------
@@ -388,6 +398,18 @@ void setup() {
   server.on("/api/status",   HTTP_GET,  handleStatus);
   server.on("/api/settings", HTTP_POST, handleSettings);
   server.on("/api/override", HTTP_POST, handleOverride);
+
+  server.on("/generate_204",              HTTP_GET, handlePortalRedirect);
+  server.on("/gen_204",                   HTTP_GET, handlePortalRedirect);
+  server.on("/hotspot-detect.html",       HTTP_GET, handlePortalRedirect);
+  server.on("/library/test/success.html", HTTP_GET, handlePortalRedirect);
+  server.on("/ncsi.txt",                  HTTP_GET, handlePortalRedirect);
+  server.on("/connecttest.txt",           HTTP_GET, handlePortalRedirect);
+  server.on("/redirect",                  HTTP_GET, handlePortalRedirect);
+  server.on("/canonical.html",            HTTP_GET, handlePortalRedirect);
+  server.on("/success.txt",               HTTP_GET, handlePortalRedirect);
+  server.on("/fwlink",                    HTTP_GET, handlePortalRedirect);
+
   server.onNotFound(handleNotFound);
   server.begin();
 
@@ -395,6 +417,7 @@ void setup() {
 }
 
 void loop() {
+  dnsServer.processNextRequest();
   server.handleClient();
   if ((uint32_t)(millis() - lastReadMs) >= cfg.readIntervalMs) {
     sampleSensors();
