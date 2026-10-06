@@ -17,12 +17,12 @@
 // ============================================================
 // STATIC CONFIG
 // ============================================================
-static const char* WIFI_SSID = "ESP32_DHT22_SOIL_SENSORS";
+static const char* WIFI_SSID = "ESP32_Plant_Care";
 static const char* WIFI_PASS = "12345678";
-static IPAddress LOCAL_IP(192, 168, 1, 50);
-static IPAddress GATEWAY  (192, 168, 1, 1);
+static IPAddress LOCAL_IP(192, 168, 4, 50);
+static IPAddress GATEWAY  (192, 168, 4, 1);
 static IPAddress SUBNET   (255, 255, 255, 0);
-static IPAddress DNS1     (192, 168, 1, 1);
+static IPAddress DNS1     (192, 168, 4, 1);
 
 // ============================================================
 // RUNTIME SETTINGS
