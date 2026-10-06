@@ -1,3 +1,12 @@
+/*
+===============================================================================
+ *  ESP32 Plant Care System
+ *  Author: Raff Alds
+ *  Github: https://www.github.com/xiv3r
+ *  License: MIT
+===============================================================================
+*/
+
 #include <WiFi.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
