@@ -1,5 +1,5 @@
 /*
- * ESP32 Plant Care — DHT22 + Soil Moisture Sensor
+ * ESP32 Plant Guardian — DHT22 + Soil Moisture Sensor
  */
 
 #include <WiFi.h>
@@ -11,7 +11,7 @@
 // -----------------------------
 // Pin definitions
 // -----------------------------
-#define SOIL_PIN   34        
+#define SOIL_PIN   34         
 #define DHT_PIN    4
 #define DHT_TYPE   DHT22
 
@@ -20,26 +20,22 @@
 #define RELAY_OFF  LOW
 
 // -----------------------------
-// WiFi
+// AP
 // -----------------------------
-#define STA_SSID     "GlobeAtHome_89042"      
-#define STA_PASSWORD "xiv3r1998"  
-#define AP_SSID      "ESP32_Plant_Care"         
+#define AP_SSID      "ESP32_Plant_Care"
 #define AP_PASSWORD  "12345678"
-#define WIFI_CONNECT_TIMEOUT_MS 12000u
-#define WIFI_RETRY_INTERVAL_MS  30000u
 
 // -----------------------------
 // Settings
 // -----------------------------
 struct Config {
-  int32_t  soilDry;        
+  int32_t  soilDry;          
   int32_t  soilHyst;         
-  float    tempLimit;        
+  float    tempLimit;       
   uint32_t readIntervalMs;   
 };
 
-Config cfg = { 2500, 150, 35.0f, 2500 };  
+Config cfg = { 2500, 150, 35.0f, 2500 };   
 
 #define DRY_MIN   600
 #define DRY_MAX   3400
@@ -47,7 +43,7 @@ Config cfg = { 2500, 150, 35.0f, 2500 };
 #define HYST_MAX  500
 #define TEMP_MIN  10.0f
 #define TEMP_MAX  80.0f
-#define INT_MIN   2000u 
+#define INT_MIN   2000u      
 #define INT_MAX   60000u
 
 // -----------------------------
@@ -63,10 +59,9 @@ float    lastTemp     = NAN;
 float    lastHum      = NAN;
 bool     faultSoil    = false;
 bool     faultDht     = false;
-uint8_t  overrideMode = 0;          
+uint8_t  overrideMode = 0;         
 uint32_t lastReadMs   = 0;
-uint32_t lastWifiTry  = 0;
-bool     apMode       = false;
+bool     apMode       = true;
 
 static char txBuf[512];             
 
@@ -178,6 +173,9 @@ static bool validateConfig(const Config& c, char* err, size_t errlen) {
   if (c.soilDry - c.soilHyst <= 100 || c.soilDry + c.soilHyst >= 3950) {
     snprintf(err, errlen, "dry/hyst band must stay inside 100..3950"); return false;
   }
+  if (!isfinite(c.tempLimit)) {
+    snprintf(err, errlen, "tempLimit must be a finite number"); return false;
+  }
   if (c.tempLimit < TEMP_MIN || c.tempLimit > TEMP_MAX) {
     snprintf(err, errlen, "tempLimit must be 10..80"); return false;
   }
@@ -199,9 +197,8 @@ void loadCfg() {
   cfg.readIntervalMs = prefs.getUInt("interval", dflt.readIntervalMs);
   prefs.end();
   char err[96];
-  if (!validateConfig(cfg, err, sizeof(err))) {   
+  if (!validateConfig(cfg, err, sizeof(err))) {
     cfg = dflt;
-    Serial.printf("[NVS] invalid stored settings (%s) -> defaults\n", err);
   }
 }
 
@@ -219,37 +216,36 @@ void saveCfg() {
 // -----------------------------
 void applyControl() {
   bool wantOn;
-  if (lastSoil < 0 || faultSoil) {          
+  if (lastSoil < 0 || faultSoil) {
     wantOn = false;
-  } else if (overrideMode == 1) {           
+  } else if (overrideMode == 1) {
     wantOn = false;
-  } else if (overrideMode == 2) {           
+  } else if (overrideMode == 2) {
     wantOn = true;
-  } else {                     
+  } else {
     bool soilDryNow = (lastSoil > cfg.soilDry + cfg.soilHyst);
     bool soilWetNow = (lastSoil < cfg.soilDry - cfg.soilHyst);
     bool hotDay     = (!faultDht && lastTemp > cfg.tempLimit);
     if      (soilDryNow || (hotDay && lastSoil > cfg.soilDry)) wantOn = true;
     else if (soilWetNow)                                       wantOn = false;
-    else                                                       wantOn = motorStatus; 
+    else                                                       wantOn = motorStatus;
   }
   if (wantOn != motorStatus) {
     motorStatus = wantOn;
     digitalWrite(RELAY_PIN, wantOn ? RELAY_ON : RELAY_OFF);
-    Serial.printf("[PUMP] -> %s\n", wantOn ? "ON" : "OFF");
   }
 }
 
 void sampleSensors() {
   lastReadMs = millis();
   lastSoil   = analogRead(SOIL_PIN);
-  faultSoil  = (lastSoil < 50 || lastSoil > 4000);          
+  faultSoil  = (lastSoil < 50 || lastSoil > 4000);
 
   float t = dht.readTemperature();
   float h = dht.readHumidity();
-  faultDht = (isnan(t) || isnan(h));
+  faultDht = (isnan(t) || isnan(h) || isinf(t) || isinf(h));
   if (!faultDht) { lastTemp = t; lastHum = h; }
- 
+
   applyControl();
 }
 
@@ -257,7 +253,7 @@ void sampleSensors() {
 // HTTP handlers
 // -----------------------------
 void handleRoot() {
-  server.send_P(200, PSTR("text/html"), INDEX_HTML);   
+  server.send_P(200, PSTR("text/html"), INDEX_HTML);
 }
 
 void handleStatus() {
@@ -267,7 +263,7 @@ void handleStatus() {
   if (isnan(lastHum))  strcpy(hBuf, "null");
   else snprintf(hBuf, sizeof(hBuf), "%.1f", (double)lastHum);
 
-  IPAddress a = apMode ? WiFi.softAPIP() : (WiFi.isConnected() ? WiFi.localIP() : IPAddress(0, 0, 0, 0));
+  IPAddress a = WiFi.softAPIP();
   snprintf(ip, sizeof(ip), "%u.%u.%u.%u", a[0], a[1], a[2], a[3]);
 
   snprintf(txBuf, sizeof(txBuf),
@@ -278,9 +274,9 @@ void handleStatus() {
     lastSoil, tBuf, hBuf, motorStatus ? 1 : 0, (unsigned)overrideMode,
     faultSoil ? 1 : 0, faultDht ? 1 : 0,
     (int)cfg.soilDry, (int)cfg.soilHyst, (double)cfg.tempLimit, (unsigned)cfg.readIntervalMs,
-    apMode ? 0 : (WiFi.isConnected() ? WiFi.RSSI() : 0), ip,
+    0, ip,
     (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(),
-    (unsigned)ESP.getMaxAllocHeap(),                     
+    (unsigned)ESP.getMaxAllocHeap(),
     (unsigned long)(millis() / 1000UL));
   server.sendHeader(F("Cache-Control"), F("no-cache"));
   server.send(200, "application/json", txBuf);
@@ -331,14 +327,13 @@ void handleSettings() {
 
   if (!err[0]) validateConfig(c, err, sizeof(err));
 
-  if (err[0]) { sendErr(400, err); return; }      
+  if (err[0]) { sendErr(400, err); return; }
 
   cfg = c;
-  saveCfg();                                      
-  applyControl();                                 
+  saveCfg();
+  applyControl();
   snprintf(txBuf, sizeof(txBuf), "{\"ok\":true}");
   server.send(200, "application/json", txBuf);
-  Serial.println("[CFG] settings updated + saved");
 }
 
 void handleOverride() {
@@ -347,7 +342,7 @@ void handleOverride() {
     sendErr(400, "mode must be 0,1,2"); return;
   }
   overrideMode = (uint8_t)m;
-  applyControl();                                 
+  applyControl();
   snprintf(txBuf, sizeof(txBuf), "{\"ok\":true,\"ovr\":%u}", (unsigned)overrideMode);
   server.send(200, "application/json", txBuf);
 }
@@ -357,38 +352,18 @@ void handleNotFound() {
   server.send(302, F("text/plain"), "");
 }
 
-// -----------------------------
-// WiFi
-// -----------------------------
-void wifiInit() {
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(STA_SSID, STA_PASSWORD);
-  Serial.printf("[WiFi] connecting to %s", STA_SSID);
-  uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_CONNECT_TIMEOUT_MS) {
-    delay(100); Serial.print('.');
-  }
-  Serial.println();
-  if (WiFi.status() == WL_CONNECTED) {
-    apMode = false;
-    Serial.printf("[WiFi] connected  http://%s\n", WiFi.localIP().toString().c_str());
-  } else {
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP(AP_SSID, AP_PASSWORD);
-    apMode = true;
-    Serial.printf("[WiFi] FALLBACK AP '%s'  http://%s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
-  }
-  if (MDNS.begin("plant")) Serial.println("[mDNS] http://plant.local");
+void handleFavicon() {
+  server.send(204, F("text/plain"), "");
 }
 
-void wifiMaintain() {    
-  if (apMode) return;
-  if (WiFi.status() != WL_CONNECTED && (uint32_t)(millis() - lastWifiTry) > WIFI_RETRY_INTERVAL_MS) {
-    lastWifiTry = millis();
-    Serial.println("[WiFi] lost — reconnecting in background");
-    WiFi.disconnect(false);
-    WiFi.begin(STA_SSID, STA_PASSWORD);
-  }
+// -----------------------------
+// WiFi AP
+// -----------------------------
+void wifiInit() {
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  apMode = true;
+  MDNS.begin("plant");
 }
 
 // -----------------------------
@@ -396,33 +371,32 @@ void wifiMaintain() {
 // -----------------------------
 void setup() {
   pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, RELAY_OFF);           
+  digitalWrite(RELAY_PIN, RELAY_OFF);
   Serial.begin(115200);
 
   analogReadResolution(12);
-  analogSetPinAttenuation(SOIL_PIN, ADC_11db); 
+  analogSetPinAttenuation(SOIL_PIN, ADC_11db);
 
   dht.begin();
   loadCfg();
-  delay(2000); 
+  delay(2000);
 
   wifiInit();
 
   server.on("/",             HTTP_GET,  handleRoot);
+  server.on("/favicon.ico",  HTTP_GET,  handleFavicon);
   server.on("/api/status",   HTTP_GET,  handleStatus);
   server.on("/api/settings", HTTP_POST, handleSettings);
   server.on("/api/override", HTTP_POST, handleOverride);
   server.onNotFound(handleNotFound);
   server.begin();
-  Serial.println("[HTTP] dashboard ready");
 
-  lastReadMs = millis() - cfg.readIntervalMs;  
+  lastReadMs = millis() - cfg.readIntervalMs;
 }
 
 void loop() {
-  server.handleClient();                        
+  server.handleClient();
   if ((uint32_t)(millis() - lastReadMs) >= cfg.readIntervalMs) {
-    sampleSensors();                            
+    sampleSensors();
   }
-  wifiMaintain();
 }
