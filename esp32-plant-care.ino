@@ -1,6 +1,11 @@
 /*
- * ESP32 Plant Guardian — DHT22 + Soil Moisture Sensor
- */
+===============================================================================
+ *  ESP32 Plant Guardian — DHT22 + Soil Moisture Sensor
+ *  Author: Raff Alds
+ *  Github: https://www.github.com/xiv3r
+ *  License: GPLv3
+===============================================================================
+*/
 
 #include <WiFi.h>
 #include <WebServer.h>
