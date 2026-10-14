@@ -954,10 +954,12 @@ setInterval(refreshStatus, 5000);
 // ==================== SETUP ====================
 void setup() {
   analogReadResolution(12);
-#if ESP_ARDUINO_VERSION_MAJOR >= 3
+#if defined(ADC_ATTEN_DB_11)
   analogSetAttenuation(ADC_ATTEN_DB_11);
-#else
+#elif defined(ADC_11db)
   analogSetAttenuation(ADC_11db);
+#elif defined(ADC_ATTENUATION_11_DB)
+  analogSetAttenuation(ADC_ATTENUATION_11_DB);
 #endif
   pinMode(SOIL_MOISTURE_PIN, INPUT);
 
