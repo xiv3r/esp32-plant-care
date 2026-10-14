@@ -22,7 +22,11 @@
 #define SETTINGS_ADDR       0
 #define SETTINGS_MAGIC      0xAB12
 
-// ==================== WIFI CREDENTIALS ====================
+// ==================== WIFI CONFIG EEPROM ====================
+#define WIFI_CFG_ADDR       300
+#define WIFI_CFG_MAGIC      0xCD34
+
+// ==================== WIFI DEFAULTS ====================
 const char* WIFI_SSID     = "YOUR_WIFI_SSID";
 const char* WIFI_PASS     = "YOUR_WIFI_PASSWORD";
 const char* AP_SSID       = "ESP32_Soil_Monitor";
@@ -41,6 +45,38 @@ struct Settings {
 };
 
 Settings settings;
+
+// ==================== WIFI CONFIG STRUCT ====================
+struct WifiConfig {
+  uint16_t magic;
+  char     staSSID[33];
+  char     staPass[65];
+  char     apSSID[33];
+  char     apPass[65];
+  uint8_t  apEnabled;
+  uint8_t  forceAP;
+  uint16_t crc;
+};
+
+WifiConfig wifiCfg;
+
+// ==================== WIFI STATE MACHINE ====================
+enum WifiApplyState : uint8_t {
+  WIFI_IDLE = 0,
+  WIFI_APPLY_PENDING,
+  WIFI_APPLY_CONNECTING,
+  WIFI_APPLY_DONE
+};
+
+volatile WifiApplyState wifiApplyState = WIFI_IDLE;
+unsigned long          wifiApplyStart = 0;
+
+enum ScanState : uint8_t {
+  SCAN_IDLE = 0,
+  SCAN_RUNNING
+};
+
+volatile ScanState scanState = SCAN_IDLE;
 
 // ==================== GLOBALS ====================
 WebServer server(80);
@@ -62,7 +98,6 @@ void readSensor();
 int  calculateMoisture(int raw);
 void setRelayHardware(bool on);
 void updateRelay();
-void setupWiFi();
 void handleRoot();
 void handleStatus();
 void handleRelay();
@@ -70,8 +105,20 @@ void handleAuto();
 void handleSettings();
 void handleNotFound();
 void snapshot(int &rawOut, int &pctOut, bool &relayOut, uint8_t &autoOut, uint8_t &thrOut);
+uint16_t calcWifiCRC(const WifiConfig& c);
+void loadWifiConfig();
+void saveWifiConfig();
+void requestWifiApply();
+void serviceWifiApply();
+String wifiStatusJSON();
+void handleWifiPage();
+void handleWifiStatus();
+void handleWifiScanStart();
+void handleWifiScanResults();
+void handleWifiSave();
+void handleWifiReset();
 
-// ==================== HTML ====================
+// ==================== INDEX HTML ====================
 const char INDEX_HTML[] PROGMEM = R"HTMLPAGE(
 <!DOCTYPE html>
 <html lang="en">
@@ -136,6 +183,7 @@ h1{text-align:center;margin-bottom:16px;font-size:1.6em}
 .badge-auto{background:#2196F3}.badge-manual{background:#ff9800}
 .center{text-align:center}.small{font-size:.85em;opacity:.75}
 .footer{text-align:center;font-size:.8em;opacity:.6;margin-top:14px}
+.footer a{color:#fff;text-decoration:underline;opacity:.9}
 .toast{position:fixed;bottom:20px;left:50%;
   transform:translateX(-50%) translateY(100px);
   background:rgba(0,0,0,.85);color:#fff;padding:12px 24px;
@@ -211,7 +259,7 @@ h1{text-align:center;margin-bottom:16px;font-size:1.6em}
     </div>
   </div>
 
-  <div class="footer">ESP32 Soil Controller | <span id="ipAddr">--</span></div>
+  <div class="footer">ESP32 Soil Controller | <span id="ipAddr">--</span> | <a href="/wifi">⚙️ WiFi</a></div>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -493,6 +541,416 @@ window.addEventListener('beforeunload', () => {
 </html>
 )HTMLPAGE";
 
+// ==================== WIFI HTML ====================
+const char WIFI_HTML[] PROGMEM = R"WIFIPAGE(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
+<meta name="color-scheme" content="dark light">
+<title>ESP32 WiFi Settings</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{
+  font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  background:linear-gradient(135deg,#667eea,#764ba2);
+  min-height:100vh;display:flex;justify-content:center;align-items:flex-start;
+  padding:20px;color:#fff;-webkit-tap-highlight-color:transparent;
+}
+.container{
+  background:rgba(255,255,255,.15);backdrop-filter:blur(10px);
+  -webkit-backdrop-filter:blur(10px);border-radius:20px;padding:24px;
+  box-shadow:0 8px 32px rgba(0,0,0,.3);width:100%;max-width:720px;
+}
+h1{text-align:center;margin-bottom:16px;font-size:1.6em}
+.card{background:rgba(255,255,255,.2);border-radius:15px;padding:18px;margin-bottom:16px}
+.card h2{font-size:1.1em;margin-bottom:12px;border-bottom:1px solid rgba(255,255,255,.3);padding-bottom:8px}
+.info-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;font-size:.9em}
+.info-item{display:flex;flex-direction:column;padding:8px;background:rgba(0,0,0,.15);border-radius:8px}
+.info-item .lbl{opacity:.75;font-size:.8em;margin-bottom:3px}
+.info-item .val{font-weight:600;word-break:break-all}
+.badge{display:inline-block;padding:2px 10px;border-radius:20px;font-size:.8em;font-weight:700}
+.badge-ok{background:#4CAF50}
+.badge-warn{background:#ff9800}
+.badge-off{background:#f44336}
+.badge-info{background:#2196F3}
+.form-group{display:flex;flex-direction:column;margin-bottom:12px}
+.form-group label{font-size:.85em;margin-bottom:5px;opacity:.9}
+.form-group input[type=text],
+.form-group input[type=password]{
+  padding:10px;border:2px solid rgba(255,255,255,.3);
+  border-radius:8px;background:rgba(0,0,0,.2);
+  color:#fff;font-size:1em;width:100%;font-family:inherit;
+}
+.form-group input:focus{outline:none;border-color:#2196F3}
+.form-row{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+.form-row input[type=checkbox]{
+  width:22px;height:22px;cursor:pointer;accent-color:#2196F3;
+}
+.form-row label{cursor:pointer;font-size:.9em}
+.btn{padding:11px 20px;border:none;border-radius:10px;font-size:.95em;
+  font-weight:600;cursor:pointer;transition:transform .15s,opacity .15s;
+  color:#fff;margin:4px;touch-action:manipulation}
+.btn:hover:not(:disabled){transform:scale(1.05)}
+.btn:active:not(:disabled){transform:scale(.95)}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn-primary{background:#2196F3}
+.btn-success{background:#4CAF50}
+.btn-danger{background:#f44336}
+.btn-warning{background:#ff9800}
+.btn-secondary{background:#546E7A}
+.btn-group{display:flex;flex-wrap:wrap;justify-content:center;gap:8px;margin:10px 0}
+.net-list{max-height:250px;overflow-y:auto;background:rgba(0,0,0,.15);
+  border-radius:10px;padding:8px;margin-top:8px}
+.net-item{padding:10px;border-radius:8px;cursor:pointer;
+  display:flex;justify-content:space-between;align-items:center;
+  transition:background .15s;margin-bottom:4px}
+.net-item:hover{background:rgba(255,255,255,.1)}
+.net-item.active{background:rgba(33,150,243,.4)}
+.net-ssid{font-weight:600;font-size:.95em}
+.net-rssi{font-size:.8em;opacity:.85}
+.toast{position:fixed;bottom:20px;left:50%;
+  transform:translateX(-50%) translateY(100px);
+  background:rgba(0,0,0,.85);color:#fff;padding:12px 24px;
+  border-radius:10px;font-size:.9em;font-weight:600;
+  box-shadow:0 4px 20px rgba(0,0,0,.4);
+  transition:transform .3s ease,opacity .3s ease;
+  opacity:0;pointer-events:none;z-index:9999;max-width:90vw;text-align:center}
+.toast.show{transform:translateX(-50%) translateY(0);opacity:1}
+.toast.error{background:rgba(244,67,54,.95)}
+.toast.success{background:rgba(76,175,80,.95)}
+.footer{text-align:center;font-size:.8em;opacity:.6;margin-top:14px}
+.footer a{color:#fff;text-decoration:underline;opacity:.9}
+@media(max-width:520px){
+  .info-grid{grid-template-columns:1fr}
+  h1{font-size:1.3em}
+}
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>📶 WiFi Settings</h1>
+
+  <div class="card">
+    <h2>📡 Current Status</h2>
+    <div class="info-grid">
+      <div class="info-item"><span class="lbl">Mode</span>
+        <span class="val"><span class="badge badge-info" id="curMode">--</span></span></div>
+      <div class="info-item"><span class="lbl">Connection</span>
+        <span class="val"><span class="badge badge-off" id="curConn">--</span></span></div>
+      <div class="info-item"><span class="lbl">STA IP</span>
+        <span class="val" id="curStaIP">--</span></div>
+      <div class="info-item"><span class="lbl">STA Signal</span>
+        <span class="val" id="curRSSI">--</span></div>
+      <div class="info-item"><span class="lbl">AP IP</span>
+        <span class="val" id="curApIP">--</span></div>
+      <div class="info-item"><span class="lbl">AP Clients</span>
+        <span class="val" id="curClients">--</span></div>
+      <div class="info-item"><span class="lbl">STA SSID</span>
+        <span class="val" id="curStaSSID">--</span></div>
+      <div class="info-item"><span class="lbl">AP SSID</span>
+        <span class="val" id="curApSSID">--</span></div>
+    </div>
+    <div class="btn-group">
+      <button class="btn btn-primary" id="btnRefresh" type="button">🔄 Refresh</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>📡 Station (Connect to Router)</h2>
+    <div class="form-group">
+      <label for="staSSID">Network Name (SSID)</label>
+      <input type="text" id="staSSID" maxlength="32" placeholder="Your WiFi network"
+             autocomplete="off" autocapitalize="off" spellcheck="false">
+    </div>
+    <div class="form-group">
+      <label for="staPass">Password (leave blank to keep current)</label>
+      <input type="password" id="staPass" maxlength="64" placeholder="••••••••"
+             autocomplete="new-password">
+    </div>
+    <div class="form-row">
+      <input type="checkbox" id="clearStaPass">
+      <label for="clearStaPass">Clear password (open network)</label>
+    </div>
+    <div class="btn-group">
+      <button class="btn btn-secondary" id="btnScan" type="button">🔍 Scan Networks</button>
+    </div>
+    <div class="net-list" id="netList" style="display:none;"></div>
+  </div>
+
+  <div class="card">
+    <h2>📻 Access Point (Broadcast Your Own)</h2>
+    <div class="form-row">
+      <input type="checkbox" id="apEnabled">
+      <label for="apEnabled">Enable Access Point</label>
+    </div>
+    <div class="form-group">
+      <label for="apSSID">AP Network Name</label>
+      <input type="text" id="apSSID" maxlength="32" placeholder="ESP32_Soil_Monitor"
+             autocomplete="off" autocapitalize="off" spellcheck="false">
+    </div>
+    <div class="form-group">
+      <label for="apPass">AP Password (8-64 chars, blank = keep)</label>
+      <input type="password" id="apPass" maxlength="64" placeholder="••••••••"
+             autocomplete="new-password">
+    </div>
+    <div class="form-row">
+      <input type="checkbox" id="forceAP">
+      <label for="forceAP">Force AP Only (disable STA)</label>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>💾 Actions</h2>
+    <div class="btn-group">
+      <button class="btn btn-success" id="btnSave"  type="button">💾 Save & Apply</button>
+      <button class="btn btn-danger"  id="btnReset" type="button">↺ Reset to Defaults</button>
+      <button class="btn btn-warning" id="btnBack"  type="button">← Back to Dashboard</button>
+    </div>
+  </div>
+
+  <div class="footer">ESP32 Soil Controller | <span id="ipAddr">--</span></div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+'use strict';
+
+const FETCH_TIMEOUT = 8000;
+
+const $ = id => document.getElementById(id);
+const elMode     = $('curMode');
+const elConn     = $('curConn');
+const elStaIP    = $('curStaIP');
+const elRSSI     = $('curRSSI');
+const elApIP     = $('curApIP');
+const elClients  = $('curClients');
+const elStaSSID  = $('curStaSSID');
+const elApSSID   = $('curApSSID');
+const elIP       = $('ipAddr');
+const elToast    = $('toast');
+
+const inpStaSSID   = $('staSSID');
+const inpStaPass   = $('staPass');
+const inpApSSID    = $('apSSID');
+const inpApPass    = $('apPass');
+const inpApEnab    = $('apEnabled');
+const inpForceAP   = $('forceAP');
+const inpClearSta  = $('clearStaPass');
+
+const btnRefresh = $('btnRefresh');
+const btnScan    = $('btnScan');
+const btnSave    = $('btnSave');
+const btnReset   = $('btnReset');
+const btnBack    = $('btnBack');
+const netList    = $('netList');
+
+let toastTimer = null;
+function showToast(msg, type) {
+  elToast.textContent = msg;
+  elToast.className = 'toast show ' + (type || '');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    elToast.className = 'toast ' + (type || '');
+  }, 2500);
+}
+
+function setBusy(el, busy) { if (el) el.disabled = !!busy; }
+
+async function apiFetch(url, opts) {
+  const ctrl = new AbortController();
+  const to = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT);
+  try {
+    const res = await fetch(url, Object.assign({}, opts, {
+      signal: ctrl.signal,
+      cache: 'no-store'
+    }));
+    clearTimeout(to);
+    const text = await res.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch(e){}
+    if (!res.ok) {
+      const msg = (data && data.error) ? data.error : ('HTTP ' + res.status);
+      throw new Error(msg);
+    }
+    return data;
+  } finally {
+    clearTimeout(to);
+  }
+}
+
+function updateStatus(d) {
+  if (!d) return;
+  elMode.textContent = d.mode || '--';
+  elMode.className = 'badge badge-info';
+
+  const connected = d.connected === 1;
+  elConn.textContent = connected ? 'Connected' : 'Disconnected';
+  elConn.className = 'badge ' + (connected ? 'badge-ok' : 'badge-off');
+
+  elStaIP.textContent   = d.staIP || '--';
+  elRSSI.textContent    = d.rssi ? (d.rssi + ' dBm') : '--';
+  elApIP.textContent    = d.apIP || '--';
+  elClients.textContent = d.apClients !== undefined ? d.apClients : '--';
+  elStaSSID.textContent = d.staSSID || '--';
+  elApSSID.textContent  = d.apSSID || '--';
+
+  if (document.activeElement !== inpStaSSID) inpStaSSID.value = d.staSSID || '';
+  if (document.activeElement !== inpApSSID)  inpApSSID.value  = d.apSSID  || '';
+  inpApEnab.checked  = d.apEnabled === 1;
+  inpForceAP.checked = d.forceAP === 1;
+}
+
+async function refreshStatus() {
+  try {
+    const d = await apiFetch('/wifi/status');
+    updateStatus(d);
+  } catch (err) {
+    showToast('Status error: ' + err.message, 'error');
+  }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  })[c]);
+}
+
+async function scanNetworks() {
+  setBusy(btnScan, true);
+  netList.style.display = 'block';
+  netList.innerHTML = '<div style="padding:10px;text-align:center;">Scanning…</div>';
+
+  try {
+    await apiFetch('/wifi/scan');
+
+    let networks = null;
+    const deadline = Date.now() + 25000;
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 700));
+      const r = await apiFetch('/wifi/scan/results');
+      if (r.state === 'running') continue;
+      if (r.state === 'failed') throw new Error('Scan failed');
+      if (r.state === 'done') { networks = r.networks; break; }
+    }
+
+    if (!networks) throw new Error('Scan timeout');
+
+    if (!Array.isArray(networks) || networks.length === 0) {
+      netList.innerHTML = '<div style="padding:10px;text-align:center;opacity:.7;">No networks found</div>';
+      return;
+    }
+
+    networks.sort((a, b) => (b.rssi || 0) - (a.rssi || 0));
+
+    netList.innerHTML = '';
+    for (const n of networks) {
+      const div = document.createElement('div');
+      div.className = 'net-item';
+      const ssid = n.ssid || '(hidden)';
+      const rssi = n.rssi || 0;
+      const enc  = n.enc === 1 ? '🔒' : '🔓';
+      div.innerHTML = '<span class="net-ssid">' + enc + ' ' + escapeHtml(ssid) + '</span>' +
+                      '<span class="net-rssi">' + rssi + ' dBm</span>';
+      div.addEventListener('click', () => {
+        inpStaSSID.value = ssid;
+        inpStaPass.value = '';
+        inpClearSta.checked = (n.enc === 0);
+        inpStaPass.focus();
+        document.querySelectorAll('.net-item').forEach(x => x.classList.remove('active'));
+        div.classList.add('active');
+        showToast('Selected: ' + ssid);
+      });
+      netList.appendChild(div);
+    }
+  } catch (err) {
+    netList.innerHTML = '<div style="padding:10px;text-align:center;color:#f44336;">Scan failed: ' +
+                        escapeHtml(err.message) + '</div>';
+  } finally {
+    setBusy(btnScan, false);
+  }
+}
+
+async function saveWifi() {
+  const staSSID = inpStaSSID.value.trim();
+  const staPass = inpStaPass.value;
+  const apSSID  = inpApSSID.value.trim();
+  const apPass  = inpApPass.value;
+  const clearSta = inpClearSta.checked;
+
+  if (staSSID.length > 32) {
+    showToast('STA SSID must be 32 chars or less', 'error'); return;
+  }
+  if (apSSID.length < 1 || apSSID.length > 32) {
+    showToast('AP SSID must be 1-32 chars', 'error'); inpApSSID.focus(); return;
+  }
+  if (apPass.length > 0 && (apPass.length < 8 || apPass.length > 64)) {
+    showToast('AP password must be 8-64 chars', 'error'); inpApPass.focus(); return;
+  }
+  if (!inpForceAP.checked && !inpApEnab.checked && staSSID.length === 0) {
+    showToast('Enable AP or enter STA SSID', 'error'); return;
+  }
+
+  setBusy(btnSave, true);
+  try {
+    const d = await apiFetch('/wifi/save', {
+      method: 'POST',
+      headers: { 'Content-Type':'application/json' },
+      body: JSON.stringify({
+        staSSID: staSSID,
+        staPass: staPass,
+        apSSID:  apSSID,
+        apPass:  apPass,
+        apEnabled: inpApEnab.checked ? 1 : 0,
+        forceAP:   inpForceAP.checked ? 1 : 0,
+        clearStaPass: clearSta ? "1" : "0"
+      })
+    });
+    showToast('Saved ✓ Device is reconnecting…', 'success');
+    if (d) updateStatus(d);
+    inpStaPass.value = '';
+    inpApPass.value  = '';
+    inpClearSta.checked = false;
+    setTimeout(refreshStatus, 3000);
+  } catch (err) {
+    showToast('Save failed: ' + err.message, 'error');
+  } finally {
+    setBusy(btnSave, false);
+  }
+}
+
+async function resetWifi() {
+  if (!confirm('Reset WiFi settings to defaults?\n\nDevice will reconnect.')) return;
+  setBusy(btnReset, true);
+  try {
+    const d = await apiFetch('/wifi/reset');
+    showToast('Reset ✓ Reconnecting…', 'success');
+    if (d) updateStatus(d);
+    setTimeout(refreshStatus, 3000);
+  } catch (err) {
+    showToast('Reset failed: ' + err.message, 'error');
+  } finally {
+    setBusy(btnReset, false);
+  }
+}
+
+btnRefresh.addEventListener('click', refreshStatus);
+btnScan.addEventListener('click',    scanNetworks);
+btnSave.addEventListener('click',    saveWifi);
+btnReset.addEventListener('click',   resetWifi);
+btnBack.addEventListener('click',    () => { location.href = '/'; });
+
+elIP.textContent = location.hostname || 'ESP32';
+refreshStatus();
+setInterval(refreshStatus, 5000);
+</script>
+</body>
+</html>
+)WIFIPAGE";
+
 // ==================== SETUP ====================
 void setup() {
   analogReadResolution(12);
@@ -513,14 +971,43 @@ void setup() {
 
   EEPROM.begin(EEPROM_SIZE);
   loadSettings();
+  loadWifiConfig();
 
-  setupWiFi();
+  WiFi.persistent(false);
+  WiFi.setSleep(false);
 
-  server.on("/",         HTTP_GET,  handleRoot);
-  server.on("/status",   HTTP_GET,  handleStatus);
-  server.on("/relay",    HTTP_GET,  handleRelay);
-  server.on("/auto",     HTTP_GET,  handleAuto);
-  server.on("/settings", HTTP_POST, handleSettings);
+  WiFi.mode(wifiCfg.forceAP ? WIFI_AP :
+            (wifiCfg.apEnabled ? WIFI_AP_STA : WIFI_STA));
+
+  if (wifiCfg.forceAP) {
+    WiFi.softAP(wifiCfg.apSSID, wifiCfg.apPass);
+    apModeActive = true;
+  } else {
+    if (wifiCfg.apEnabled) {
+      WiFi.softAP(wifiCfg.apSSID, wifiCfg.apPass);
+    }
+    WiFi.begin(wifiCfg.staSSID, wifiCfg.staPass);
+
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+      delay(300);
+      yield();
+    }
+
+    apModeActive = (WiFi.status() != WL_CONNECTED) && wifiCfg.apEnabled;
+  }
+
+  server.on("/",                  HTTP_GET,  handleRoot);
+  server.on("/status",            HTTP_GET,  handleStatus);
+  server.on("/relay",             HTTP_GET,  handleRelay);
+  server.on("/auto",              HTTP_GET,  handleAuto);
+  server.on("/settings",          HTTP_POST, handleSettings);
+  server.on("/wifi",              HTTP_GET,  handleWifiPage);
+  server.on("/wifi/status",       HTTP_GET,  handleWifiStatus);
+  server.on("/wifi/scan",         HTTP_GET,  handleWifiScanStart);
+  server.on("/wifi/scan/results", HTTP_GET,  handleWifiScanResults);
+  server.on("/wifi/save",         HTTP_POST, handleWifiSave);
+  server.on("/wifi/reset",        HTTP_GET,  handleWifiReset);
   server.onNotFound(handleNotFound);
   server.begin();
 
@@ -532,6 +1019,7 @@ void setup() {
 // ==================== LOOP ====================
 void loop() {
   server.handleClient();
+  serviceWifiApply();
 
   unsigned long now = millis();
 
@@ -543,11 +1031,12 @@ void loop() {
     updateRelay();
   }
 
-  if (!apModeActive && (now - lastWiFiCheck >= 15000UL)) {
+  if (!apModeActive && !wifiCfg.forceAP && wifiApplyState == WIFI_IDLE &&
+      (now - lastWiFiCheck >= 15000UL)) {
     lastWiFiCheck = now;
     if (WiFi.status() != WL_CONNECTED) {
       WiFi.disconnect();
-      WiFi.begin(WIFI_SSID, WIFI_PASS);
+      WiFi.begin(wifiCfg.staSSID, wifiCfg.staPass);
     }
   }
 
@@ -685,25 +1174,317 @@ void saveSettings() {
   EEPROM.commit();
 }
 
-// ==================== WIFI ====================
-void setupWiFi() {
-  WiFi.persistent(false);
-  WiFi.setSleep(false);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
-    delay(300);
+// ==================== WIFI CONFIG ====================
+uint16_t calcWifiCRC(const WifiConfig& c) {
+  const uint8_t* p = (const uint8_t*)&c;
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < sizeof(WifiConfig) - sizeof(uint16_t); i++) {
+    crc ^= p[i];
+    for (int j = 0; j < 8; j++)
+      crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : (crc >> 1);
   }
+  return crc;
+}
+
+void loadWifiConfig() {
+  EEPROM.get(WIFI_CFG_ADDR, wifiCfg);
+
+  bool valid = (wifiCfg.magic == WIFI_CFG_MAGIC)
+            && (wifiCfg.crc == calcWifiCRC(wifiCfg))
+            && (wifiCfg.apEnabled <= 1)
+            && (wifiCfg.forceAP <= 1)
+            && (strlen(wifiCfg.apSSID) >= 1)
+            && (strlen(wifiCfg.apSSID) <= 32)
+            && (strlen(wifiCfg.apPass) >= 8)
+            && (strlen(wifiCfg.apPass) <= 64)
+            && (strlen(wifiCfg.staSSID) <= 32)
+            && (strlen(wifiCfg.staPass) <= 64)
+            && (strlen(wifiCfg.staSSID) >= 1 || wifiCfg.apEnabled == 1);
+
+  if (!valid) {
+    memset(&wifiCfg, 0, sizeof(wifiCfg));
+    wifiCfg.magic = WIFI_CFG_MAGIC;
+    strncpy(wifiCfg.staSSID, WIFI_SSID, sizeof(wifiCfg.staSSID) - 1);
+    strncpy(wifiCfg.staPass, WIFI_PASS, sizeof(wifiCfg.staPass) - 1);
+    strncpy(wifiCfg.apSSID,  AP_SSID,   sizeof(wifiCfg.apSSID) - 1);
+    strncpy(wifiCfg.apPass,  AP_PASS,   sizeof(wifiCfg.apPass) - 1);
+    wifiCfg.apEnabled = 1;
+    wifiCfg.forceAP   = 0;
+    wifiCfg.crc       = calcWifiCRC(wifiCfg);
+    saveWifiConfig();
+  }
+}
+
+void saveWifiConfig() {
+  wifiCfg.magic = WIFI_CFG_MAGIC;
+  wifiCfg.crc   = calcWifiCRC(wifiCfg);
+  EEPROM.put(WIFI_CFG_ADDR, wifiCfg);
+  EEPROM.commit();
+}
+
+void requestWifiApply() {
+  wifiApplyState = WIFI_APPLY_PENDING;
+}
+
+void serviceWifiApply() {
+  unsigned long now = millis();
+
+  switch (wifiApplyState) {
+    case WIFI_IDLE:
+      return;
+
+    case WIFI_APPLY_PENDING:
+      WiFi.disconnect(true);
+      WiFi.mode(wifiCfg.forceAP ? WIFI_AP :
+                (wifiCfg.apEnabled ? WIFI_AP_STA : WIFI_STA));
+
+      if (wifiCfg.forceAP) {
+        WiFi.softAP(wifiCfg.apSSID, wifiCfg.apPass);
+        apModeActive = true;
+        wifiApplyState = WIFI_APPLY_DONE;
+      } else {
+        if (wifiCfg.apEnabled) {
+          WiFi.softAP(wifiCfg.apSSID, wifiCfg.apPass);
+        }
+        WiFi.begin(wifiCfg.staSSID, wifiCfg.staPass);
+        wifiApplyStart = now;
+        wifiApplyState = WIFI_APPLY_CONNECTING;
+      }
+      return;
+
+    case WIFI_APPLY_CONNECTING:
+      if (WiFi.status() == WL_CONNECTED) {
+        apModeActive = false;
+        wifiApplyState = WIFI_APPLY_DONE;
+      } else if (now - wifiApplyStart > 15000UL) {
+        apModeActive = wifiCfg.apEnabled;
+        wifiApplyState = WIFI_APPLY_DONE;
+      }
+      return;
+
+    case WIFI_APPLY_DONE:
+      wifiApplyState = WIFI_IDLE;
+      return;
+  }
+}
+
+String wifiStatusJSON() {
+  String j = "{";
+  wifi_mode_t m = WiFi.getMode();
+  const char* modeStr =
+    (m == WIFI_AP)     ? "AP" :
+    (m == WIFI_STA)    ? "STA" :
+    (m == WIFI_AP_STA) ? "AP+STA" : "OFF";
+
+  j += "\"mode\":\"" + String(modeStr) + "\",";
+  j += "\"staSSID\":\"" + String(wifiCfg.staSSID) + "\",";
+  j += "\"apSSID\":\""  + String(wifiCfg.apSSID)  + "\",";
+  j += "\"apEnabled\":" + String(wifiCfg.apEnabled) + ",";
+  j += "\"forceAP\":"   + String(wifiCfg.forceAP) + ",";
+  j += "\"connected\":" + String(WiFi.status() == WL_CONNECTED ? 1 : 0) + ",";
+  j += "\"applyState\":" + String((int)wifiApplyState) + ",";
 
   if (WiFi.status() == WL_CONNECTED) {
-    apModeActive = false;
+    j += "\"staIP\":\"" + WiFi.localIP().toString() + "\",";
+    j += "\"rssi\":"     + String(WiFi.RSSI()) + ",";
   } else {
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP(AP_SSID, AP_PASS);
-    apModeActive = true;
+    j += "\"staIP\":\"\",";
+    j += "\"rssi\":0,";
   }
+
+  if (m == WIFI_AP || m == WIFI_AP_STA) {
+    j += "\"apIP\":\"" + WiFi.softAPIP().toString() + "\",";
+    j += "\"apClients\":" + String(WiFi.softAPgetStationNum()) + ",";
+  } else {
+    j += "\"apIP\":\"\",";
+    j += "\"apClients\":0,";
+  }
+
+  j += "\"mac\":\"" + WiFi.macAddress() + "\"";
+  j += "}";
+  return j;
+}
+
+// ==================== WIFI HANDLERS ====================
+void handleWifiPage() {
+  server.send_P(200, "text/html", WIFI_HTML);
+}
+
+void handleWifiStatus() {
+  server.send(200, "application/json", wifiStatusJSON());
+}
+
+void handleWifiScanStart() {
+  if (scanState == SCAN_RUNNING) {
+    server.send(200, "application/json", "{\"state\":\"running\"}");
+    return;
+  }
+
+  WiFi.scanDelete();
+
+  wifi_mode_t m = WiFi.getMode();
+  if (m == WIFI_AP) {
+    WiFi.mode(WIFI_AP_STA);
+  }
+
+  int16_t r = WiFi.scanNetworks(true, false);
+  if (r == WIFI_SCAN_FAILED) {
+    server.send(500, "application/json", "{\"error\":\"scan failed\"}");
+    return;
+  }
+
+  scanState = SCAN_RUNNING;
+  server.send(200, "application/json", "{\"state\":\"running\"}");
+}
+
+void handleWifiScanResults() {
+  int16_t n = WiFi.scanComplete();
+
+  if (n == WIFI_SCAN_RUNNING) {
+    server.send(200, "application/json", "{\"state\":\"running\"}");
+    return;
+  }
+  if (n == WIFI_SCAN_FAILED) {
+    scanState = SCAN_IDLE;
+    server.send(200, "application/json", "{\"state\":\"failed\"}");
+    return;
+  }
+  if (n < 0) {
+    server.send(200, "application/json", "{\"state\":\"idle\"}");
+    return;
+  }
+
+  String j = "{\"state\":\"done\",\"networks\":[";
+  for (int i = 0; i < n; i++) {
+    if (i > 0) j += ",";
+    String ssid = WiFi.SSID(i);
+    ssid.replace("\"", "\\\"");
+    j += "{\"ssid\":\"" + ssid + "\",";
+    j += "\"rssi\":" + String(WiFi.RSSI(i)) + ",";
+    j += "\"enc\":" + String(WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? 0 : 1) + "}";
+  }
+  j += "]}";
+  WiFi.scanDelete();
+  scanState = SCAN_IDLE;
+  server.send(200, "application/json", j);
+}
+
+void handleWifiSave() {
+  if (!server.hasArg("plain")) {
+    server.send(400, "application/json", "{\"error\":\"no body\"}");
+    return;
+  }
+
+  String body = server.arg("plain");
+
+  auto extractStr = [&](const char* key, const char* def) -> String {
+    String k = String("\"") + key + "\":\"";
+    int i = body.indexOf(k);
+    if (i < 0) return String(def);
+    i += k.length();
+    int end = body.indexOf('"', i);
+    if (end < 0) return String(def);
+    return body.substring(i, end);
+  };
+
+  auto extractInt = [&](const char* key, int def) -> int {
+    String k = String("\"") + key + "\":";
+    int i = body.indexOf(k);
+    if (i < 0) return def;
+    i += k.length();
+    while (i < (int)body.length() && (body[i]==' '||body[i]=='\t')) i++;
+    int v = 0; bool neg = false;
+    if (i < (int)body.length() && body[i]=='-'){neg=true;i++;}
+    bool found = false;
+    while (i < (int)body.length() && isdigit((unsigned char)body[i])) {
+      v = v*10 + (body[i]-'0'); i++; found = true;
+    }
+    return found ? (neg?-v:v) : def;
+  };
+
+  String newStaSSID = extractStr("staSSID", wifiCfg.staSSID);
+  String newStaPass = extractStr("staPass", "");
+  String newApSSID  = extractStr("apSSID",  wifiCfg.apSSID);
+  String newApPass  = extractStr("apPass",  "");
+  int    apEnabled  = extractInt("apEnabled", wifiCfg.apEnabled);
+  int    forceAP    = extractInt("forceAP",   wifiCfg.forceAP);
+  String clearStaPw = extractStr("clearStaPass", "0");
+
+  if (newApSSID.length() < 1 || newApSSID.length() > 32) {
+    server.send(400, "application/json",
+                "{\"error\":\"AP SSID must be 1-32 chars\"}");
+    return;
+  }
+  if (newApPass.length() > 0 &&
+      (newApPass.length() < 8 || newApPass.length() > 64)) {
+    server.send(400, "application/json",
+                "{\"error\":\"AP password must be 8-64 chars or empty\"}");
+    return;
+  }
+  if (newStaSSID.length() > 32) {
+    server.send(400, "application/json",
+                "{\"error\":\"STA SSID must be 32 chars or less\"}");
+    return;
+  }
+  if (newStaPass.length() > 64) {
+    server.send(400, "application/json",
+                "{\"error\":\"STA password must be 64 chars or less\"}");
+    return;
+  }
+
+  bool newApEnabled = (apEnabled == 1);
+  bool newForceAP   = (forceAP == 1);
+
+  if (!newForceAP && !newApEnabled && newStaSSID.length() == 0) {
+    server.send(400, "application/json",
+                "{\"error\":\"Cannot disable both STA and AP - device would be unreachable\"}");
+    return;
+  }
+
+  strncpy(wifiCfg.staSSID, newStaSSID.c_str(), sizeof(wifiCfg.staSSID) - 1);
+  wifiCfg.staSSID[sizeof(wifiCfg.staSSID) - 1] = 0;
+
+  if (clearStaPw == "1") {
+    wifiCfg.staPass[0] = 0;
+  } else if (newStaPass.length() > 0) {
+    strncpy(wifiCfg.staPass, newStaPass.c_str(), sizeof(wifiCfg.staPass) - 1);
+    wifiCfg.staPass[sizeof(wifiCfg.staPass) - 1] = 0;
+  }
+
+  strncpy(wifiCfg.apSSID, newApSSID.c_str(), sizeof(wifiCfg.apSSID) - 1);
+  wifiCfg.apSSID[sizeof(wifiCfg.apSSID) - 1] = 0;
+
+  if (newApPass.length() > 0) {
+    strncpy(wifiCfg.apPass, newApPass.c_str(), sizeof(wifiCfg.apPass) - 1);
+    wifiCfg.apPass[sizeof(wifiCfg.apPass) - 1] = 0;
+  }
+
+  wifiCfg.apEnabled = newApEnabled ? 1 : 0;
+  wifiCfg.forceAP   = newForceAP   ? 1 : 0;
+
+  saveWifiConfig();
+
+  String resp = wifiStatusJSON();
+  server.send(200, "application/json", resp);
+
+  requestWifiApply();
+}
+
+void handleWifiReset() {
+  memset(&wifiCfg, 0, sizeof(wifiCfg));
+  wifiCfg.magic = WIFI_CFG_MAGIC;
+  strncpy(wifiCfg.staSSID, WIFI_SSID, sizeof(wifiCfg.staSSID) - 1);
+  strncpy(wifiCfg.staPass, WIFI_PASS, sizeof(wifiCfg.staPass) - 1);
+  strncpy(wifiCfg.apSSID,  AP_SSID,   sizeof(wifiCfg.apSSID) - 1);
+  strncpy(wifiCfg.apPass,  AP_PASS,   sizeof(wifiCfg.apPass) - 1);
+  wifiCfg.apEnabled = 1;
+  wifiCfg.forceAP   = 0;
+  saveWifiConfig();
+
+  String resp = wifiStatusJSON();
+  server.send(200, "application/json", resp);
+
+  requestWifiApply();
 }
 
 // ==================== SNAPSHOT ====================
@@ -718,7 +1499,7 @@ void snapshot(int &rawOut, int &pctOut, bool &relayOut,
   thrOut   = settings.threshold;
 }
 
-// ==================== WEB HANDLERS ====================
+// ==================== DASHBOARD HANDLERS ====================
 void handleRoot() {
   server.send_P(200, "text/html", INDEX_HTML);
 }
