@@ -4,7 +4,6 @@
  * Hardware:
  *   - Soil Moisture Sensor: GPIO34 (ADC1_CH6, input-only)
  *   - Relay Module:         GPIO25 (Digital Output)
- * Libraries: WiFi, WebServer, EEPROM (all built-in)
 ==================================================================
  */
 
