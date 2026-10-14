@@ -1,8 +1,7 @@
-
 /* 
-==============================================
+==========================================
  * ESP32 Soil Moisture Monitor & Relay Control
-==============================================
+==========================================
  */
 
 #include <WiFi.h>
@@ -135,10 +134,14 @@ void setup() {
 
   pinMode(SOIL_MOISTURE_PIN, INPUT);
   analogReadResolution(12);
-#if ESP_ARDUINO_VERSION_MAJOR >= 3
+#if defined(ADC_ATTEN_DB_11)
   analogSetAttenuation(ADC_ATTEN_DB_11);
-#else
+#elif defined(ADC_11db)
   analogSetAttenuation(ADC_11db);
+#elif defined(ADC_ATTEN_DB_12)
+  analogSetAttenuation(ADC_ATTEN_DB_12);
+#else
+  analogSetAttenuation(ADC_ATTENDB_MAX);
 #endif
 
   prefs.begin("soilmonitor", false);
