@@ -1,589 +1,609 @@
+/*
+ * ESP32 Soil Moisture Monitoring + Relay Control + Web Dashboard
+ * ================================================================
+ * Hardware:
+ *   - Soil Moisture Sensor: GPIO34 (ADC1_CH6, input-only)
+ *   - Relay Module:         GPIO25 (Digital Output)
+ *
+ * Libraries: WiFi, WebServer, EEPROM (all built-in)
+ */
+
 #include <WiFi.h>
 #include <WebServer.h>
 #include <EEPROM.h>
 
-#define SOIL_MOISTURE_PIN 34
-#define RELAY_PIN         25
-#define RELAY_ACTIVE_LOW  0
-#define AUTO_HYSTERESIS   3
-#define SENSOR_FAULT_RAIL 3
+// ==================== PIN CONFIGURATION ====================
+#define SOIL_MOISTURE_PIN   34
+#define RELAY_PIN           25
+#define RELAY_ACTIVE_LOW    true
 
+// ==================== EEPROM ====================
 #define EEPROM_SIZE         512
-#define EEPROM_MAGIC_NUMBER 0xAB
-#define EEPROM_MAGIC_ADDR   0
-#define WIFI_SSID_MAX       32
-#define WIFI_PASS_MAX       63
+#define SETTINGS_ADDR       0
+#define SETTINGS_MAGIC      0xAB12
 
-#define ADDR_MAGIC              0
-#define ADDR_WIFI_SSID          1
-#define ADDR_WIFI_PASS          65
-#define ADDR_MOISTURE_THRESHOLD 129
-#define ADDR_AUTO_MODE          131
-#define ADDR_RELAY_STATE        132
-#define ADDR_CALIBRATION_DRY    133
-#define ADDR_CALIBRATION_WET    135
-#define ADDR_SENSOR_MIN         137
-#define ADDR_SENSOR_MAX         139
+// ==================== WIFI CREDENTIALS ====================
+const char* WIFI_SSID     = "YOUR_WIFI_SSID";
+const char* WIFI_PASS     = "YOUR_WIFI_PASSWORD";
+const char* AP_SSID       = "ESP32_Soil_Monitor";
+const char* AP_PASS       = "password123";
 
-#define DEFAULT_MOISTURE_THRESHOLD 40
-#define DEFAULT_CALIBRATION_DRY    4095
-#define DEFAULT_CALIBRATION_WET    0
-#define DEFAULT_SENSOR_MIN         0
-#define DEFAULT_SENSOR_MAX         4095
+// ==================== SETTINGS STRUCT ====================
+struct Settings {
+  uint16_t magic;
+  uint16_t dryValue;
+  uint16_t wetValue;
+  uint8_t  threshold;
+  uint8_t  autoMode;
+  uint8_t  relayState;
+  uint16_t readInterval;
+  uint16_t crc;
+};
 
+Settings settings;
+
+// ==================== GLOBALS ====================
 WebServer server(80);
 
-String wifiSSID = "";
-String wifiPassword = "";
-bool   apMode = false;
+volatile int  g_rawMoisture      = 0;
+volatile int  g_moisturePercent  = 0;
+volatile bool g_relayActive      = false;
+portMUX_TYPE  g_mux              = portMUX_INITIALIZER_UNLOCKED;
 
-int  moistureThreshold = DEFAULT_MOISTURE_THRESHOLD;
-bool autoMode          = true;
-bool relayState        = false;
-
-int calibrationDry = DEFAULT_CALIBRATION_DRY;
-int calibrationWet = DEFAULT_CALIBRATION_WET;
-int sensorMin      = DEFAULT_SENSOR_MIN;
-int sensorMax      = DEFAULT_SENSOR_MAX;
-
-unsigned long lastSensorRead = 0;
+unsigned long lastReadTime   = 0;
 unsigned long lastWiFiCheck  = 0;
-const unsigned long SENSOR_INTERVAL     = 2000;
-const unsigned long WIFI_CHECK_INTERVAL = 30000;
+bool          apModeActive   = false;
 
-int rawMoistureValue   = 0;
-int moisturePercent    = 0;
-int smoothedMoisture   = 50;
-bool sensorFault       = false;
-int  sensorRailCount   = 0;
+// ==================== FORWARD DECLARATIONS ====================
+void loadSettings();
+void saveSettings();
+uint16_t calcCRC(const Settings& s);
+void readSensor();
+int  calculateMoisture(int raw);
+void setRelayHardware(bool on);
+void updateRelay();
+void setupWiFi();
+void handleRoot();
+void handleStatus();
+void handleRelay();
+void handleAuto();
+void handleSettings();
+void handleNotFound();
+void snapshot(int &rawOut, int &pctOut, bool &relayOut, uint8_t &autoOut, uint8_t &thrOut);
 
-const int SMOOTHING_SAMPLES = 10;
-int moistureReadings[SMOOTHING_SAMPLES];
-int readingIndex = 0;
-
-enum WifiState { WIFI_STATE_INIT, WIFI_STATE_CONNECTING, WIFI_STATE_CONNECTED, WIFI_STATE_AP };
-WifiState wifiState = WIFI_STATE_INIT;
-unsigned long wifiConnectStart = 0;
-const unsigned long WIFI_CONNECT_TIMEOUT = 15000;
-
-bool pendingRestart = false;
-unsigned long pendingRestartAt = 0;
-
-bool eepromDirty = false;
-unsigned long eepromDirtyAt = 0;
-
-const char* AP_SSID     = "ESP32_SoilMonitor";
-const char* AP_PASSWORD = "12345678";
-
-const char INDEX_HTML[] PROGMEM = R"rawliteral(
+// ==================== HTML ====================
+const char INDEX_HTML[] PROGMEM = R"HTMLPAGE(
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ESP32 Soil Monitor</title>
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
+<meta name="color-scheme" content="dark light">
+<title>ESP32 Soil Dashboard</title>
 <style>
-*{margin:0;padding:0;box-sizing:border-box;font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif}
-body{background:linear-gradient(135deg,#1a1a2e 0%,#16213e 100%);min-height:100vh;color:#fff;padding:20px}
-.container{max-width:900px;margin:0 auto}
-h1{text-align:center;margin-bottom:30px;font-size:2rem;background:linear-gradient(90deg,#00d4ff,#00ff88);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
-.dashboard{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:20px;margin-bottom:20px}
-.card{background:rgba(255,255,255,0.05);border-radius:15px;padding:25px;border:1px solid rgba(255,255,255,0.1);backdrop-filter:blur(10px);transition:transform 0.3s ease,box-shadow 0.3s ease}
-.card:hover{transform:translateY(-5px);box-shadow:0 10px 30px rgba(0,212,255,0.2)}
-.card h2{font-size:1.1rem;margin-bottom:15px;color:#00d4ff;display:flex;align-items:center;gap:10px}
-.moisture-value{font-size:3rem;font-weight:bold;text-align:center;margin:20px 0}
-.moisture-value.dry{color:#ff6b6b}
-.moisture-value.moderate{color:#ffd93d}
-.moisture-value.wet{color:#00ff88}
-.moisture-bar{width:100%;height:20px;background:rgba(255,255,255,0.1);border-radius:10px;overflow:hidden;margin-top:15px}
-.moisture-bar-fill{height:100%;border-radius:10px;transition:width 0.5s ease;background:linear-gradient(90deg,#ff6b6b,#ffd93d,#00ff88)}
-.status-badge{display:inline-block;padding:5px 15px;border-radius:20px;font-size:0.85rem;font-weight:600;margin:5px 0}
-.status-badge.active{background:rgba(0,255,136,0.2);color:#00ff88;border:1px solid #00ff88}
-.status-badge.inactive{background:rgba(255,107,107,0.2);color:#ff6b6b;border:1px solid #ff6b6b}
-.status-badge.warn{background:rgba(255,217,61,0.2);color:#ffd93d;border:1px solid #ffd93d}
-.btn{padding:12px 24px;border:none;border-radius:10px;cursor:pointer;font-size:1rem;font-weight:600;transition:all 0.3s ease;width:100%;margin-top:10px}
-.btn:disabled{cursor:not-allowed}
-.btn-primary{background:linear-gradient(135deg,#00d4ff,#0099cc);color:#fff}
-.btn-primary:hover:not(:disabled){background:linear-gradient(135deg,#00e5ff,#00aadd);box-shadow:0 5px 20px rgba(0,212,255,0.4)}
-.btn-danger{background:linear-gradient(135deg,#ff6b6b,#cc5555);color:#fff}
-.btn-danger:hover:not(:disabled){background:linear-gradient(135deg,#ff7b7b,#dd6666);box-shadow:0 5px 20px rgba(255,107,107,0.4)}
-.btn-success{background:linear-gradient(135deg,#00ff88,#00cc6a);color:#1a1a2e}
-.btn-success:hover:not(:disabled){background:linear-gradient(135deg,#00ff99,#00dd7b);box-shadow:0 5px 20px rgba(0,255,136,0.4)}
-.btn-warning{background:linear-gradient(135deg,#ffd93d,#ccad30);color:#1a1a2e}
-.btn-warning:hover:not(:disabled){background:linear-gradient(135deg,#ffe94d,#ddbd40);box-shadow:0 5px 20px rgba(255,217,61,0.4)}
-.settings-form{display:flex;flex-direction:column;gap:15px}
-.form-group{display:flex;flex-direction:column;gap:5px}
-.form-group label{font-size:0.9rem;color:#aaa}
-.form-group input,.form-group select{padding:12px;border-radius:8px;border:1px solid rgba(255,255,255,0.2);background:rgba(255,255,255,0.05);color:#fff;font-size:1rem}
-.form-group input:focus{outline:none;border-color:#00d4ff}
-.form-group input[type="range"]{padding:0;height:8px;-webkit-appearance:none;background:rgba(255,255,255,0.1);border-radius:4px}
-.form-group input[type="range"]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;height:20px;border-radius:50%;background:#00d4ff;cursor:pointer;box-shadow:0 0 10px rgba(0,212,255,0.5)}
-.range-value{text-align:center;font-size:1.5rem;font-weight:bold;color:#00d4ff}
-.info-row{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.05)}
-.info-row:last-child{border-bottom:none}
-.info-label{color:#aaa}
-.info-value{font-weight:600}
-.toast{position:fixed;bottom:30px;left:50%;transform:translateX(-50%) translateY(100px);background:rgba(0,255,136,0.9);color:#1a1a2e;padding:15px 30px;border-radius:10px;font-weight:600;opacity:0;transition:all 0.3s ease;z-index:1000;max-width:90vw;text-align:center}
+*{box-sizing:border-box;margin:0;padding:0}
+body{
+  font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  background:linear-gradient(135deg,#667eea,#764ba2);
+  min-height:100vh;display:flex;justify-content:center;align-items:flex-start;
+  padding:20px;color:#fff;-webkit-tap-highlight-color:transparent;
+}
+.container{
+  background:rgba(255,255,255,.15);backdrop-filter:blur(10px);
+  -webkit-backdrop-filter:blur(10px);border-radius:20px;padding:24px;
+  box-shadow:0 8px 32px rgba(0,0,0,.3);width:100%;max-width:720px;
+}
+h1{text-align:center;margin-bottom:16px;font-size:1.6em}
+.card{background:rgba(255,255,255,.2);border-radius:15px;padding:18px;margin-bottom:16px}
+.card h2{font-size:1.1em;margin-bottom:12px;border-bottom:1px solid rgba(255,255,255,.3);padding-bottom:8px}
+.sensor-value{font-size:3em;font-weight:700;text-align:center;margin:8px 0;font-variant-numeric:tabular-nums}
+.sensor-label{text-align:center;opacity:.8;font-size:.9em}
+.progress-bar{width:100%;height:26px;background:rgba(0,0,0,.3);
+  border-radius:13px;overflow:hidden;margin:14px 0;position:relative}
+.progress-fill{height:100%;transition:width .4s ease,background .4s ease;
+  display:flex;align-items:center;justify-content:center;
+  font-weight:700;font-size:.85em;white-space:nowrap;overflow:hidden}
+.relay-status{display:flex;justify-content:center;margin:12px 0}
+.relay-indicator{width:70px;height:70px;border-radius:50%;
+  display:flex;align-items:center;justify-content:center;
+  font-size:1.4em;font-weight:700;transition:all .3s;
+  box-shadow:0 4px 15px rgba(0,0,0,.3);user-select:none}
+.relay-on{background:#4CAF50;box-shadow:0 0 20px #4CAF50,0 4px 15px rgba(0,0,0,.3)}
+.relay-off{background:#f44336;box-shadow:0 0 20px #f44336,0 4px 15px rgba(0,0,0,.3)}
+.btn{padding:11px 20px;border:none;border-radius:10px;font-size:.95em;
+  font-weight:600;cursor:pointer;transition:transform .15s,opacity .15s;
+  color:#fff;margin:4px;touch-action:manipulation}
+.btn:hover:not(:disabled){transform:scale(1.05)}
+.btn:active:not(:disabled){transform:scale(.95)}
+.btn:disabled{opacity:.5;cursor:not-allowed;transform:none}
+.btn-primary{background:#2196F3}.btn-success{background:#4CAF50}
+.btn-danger{background:#f44336}.btn-warning{background:#ff9800}
+.btn-group{display:flex;flex-wrap:wrap;justify-content:center;gap:8px;margin:10px 0}
+.settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.setting-item{display:flex;flex-direction:column}
+.setting-item label{font-size:.82em;margin-bottom:4px;opacity:.9}
+.setting-item input{padding:9px;border:2px solid rgba(255,255,255,.3);
+  border-radius:8px;background:rgba(0,0,0,.2);color:#fff;font-size:1em;
+  width:100%;font-variant-numeric:tabular-nums}
+.setting-item input:focus{outline:none;border-color:#2196F3}
+.setting-item input:invalid{border-color:#f44336}
+.setting-item input::-webkit-outer-spin-button,
+.setting-item input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+.setting-item input[type=number]{-moz-appearance:textfield}
+.status-badge{display:inline-block;padding:4px 14px;border-radius:20px;
+  font-size:.8em;font-weight:700}
+.badge-auto{background:#2196F3}.badge-manual{background:#ff9800}
+.center{text-align:center}.small{font-size:.85em;opacity:.75}
+.footer{text-align:center;font-size:.8em;opacity:.6;margin-top:14px}
+.toast{position:fixed;bottom:20px;left:50%;
+  transform:translateX(-50%) translateY(100px);
+  background:rgba(0,0,0,.85);color:#fff;padding:12px 24px;
+  border-radius:10px;font-size:.9em;font-weight:600;
+  box-shadow:0 4px 20px rgba(0,0,0,.4);
+  transition:transform .3s ease,opacity .3s ease;
+  opacity:0;pointer-events:none;z-index:9999;max-width:90vw;text-align:center}
 .toast.show{transform:translateX(-50%) translateY(0);opacity:1}
-.toast.error{background:rgba(255,107,107,0.9);color:#fff}
-.tabs{display:flex;gap:10px;margin-bottom:20px;flex-wrap:wrap}
-.tab{padding:10px 20px;border-radius:10px;cursor:pointer;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);transition:all 0.3s ease;font-weight:600}
-.tab.active{background:linear-gradient(135deg,#00d4ff,#0099cc);border-color:transparent}
-.tab:hover:not(.active){background:rgba(255,255,255,0.1)}
-.tab-content{display:none}
-.tab-content.active{display:block}
-.relay-indicator{width:80px;height:80px;border-radius:50%;margin:20px auto;display:flex;align-items:center;justify-content:center;font-size:2rem;transition:all 0.3s ease}
-.relay-indicator.on{background:radial-gradient(circle,rgba(0,255,136,0.3),transparent);box-shadow:0 0 30px rgba(0,255,136,0.5);color:#00ff88}
-.relay-indicator.off{background:radial-gradient(circle,rgba(255,107,107,0.2),transparent);box-shadow:0 0 30px rgba(255,107,107,0.3);color:#ff6b6b}
-.calibration-info{background:rgba(255,217,61,0.1);border:1px solid rgba(255,217,61,0.3);border-radius:10px;padding:15px;margin-top:15px;font-size:0.9rem}
-@media (max-width:600px){h1{font-size:1.5rem}.moisture-value{font-size:2.5rem}.card{padding:20px}}
+.toast.error{background:rgba(244,67,54,.95)}
+.toast.success{background:rgba(76,175,80,.95)}
+.offline-banner{display:none;background:rgba(244,67,54,.9);
+  padding:8px 14px;border-radius:8px;text-align:center;
+  font-size:.85em;font-weight:600;margin-bottom:12px}
+.offline-banner.show{display:block}
+@media(max-width:520px){
+  .settings-grid{grid-template-columns:1fr}
+  h1{font-size:1.3em}.sensor-value{font-size:2.4em}
+}
 </style>
 </head>
 <body>
 <div class="container">
-<h1>🌱 ESP32 Soil Monitor</h1>
-<div class="tabs">
-<div class="tab active" onclick="showTab(this,'dashboard')">📊 Dashboard</div>
-<div class="tab" onclick="showTab(this,'control')">🎛️ Control</div>
-<div class="tab" onclick="showTab(this,'settings')">⚙️ Settings</div>
-<div class="tab" onclick="showTab(this,'calibration')">📐 Calibration</div>
+  <div class="offline-banner" id="offlineBanner">⚠️ ESP32 connection lost. Retrying…</div>
+  <h1>🌱 Soil Moisture Dashboard</h1>
+
+  <div class="card">
+    <h2>📊 Sensor Reading</h2>
+    <div class="sensor-value" id="moistureValue">--%</div>
+    <div class="sensor-label">Soil Moisture</div>
+    <div class="progress-bar">
+      <div class="progress-fill" id="moistureBar" style="width:0%;background:#4CAF50"></div>
+    </div>
+    <div class="center small">
+      Raw ADC: <span id="rawValue">--</span> |
+      Threshold: <span id="thresholdValue">--</span>%
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>🔌 Relay / Pump</h2>
+    <div class="relay-status">
+      <div class="relay-indicator relay-off" id="relayIndicator">OFF</div>
+    </div>
+    <div class="center">
+      <span class="status-badge badge-auto" id="modeBadge">AUTO</span>
+    </div>
+    <div class="btn-group">
+      <button class="btn btn-success" id="btnOn"   type="button">ON</button>
+      <button class="btn btn-danger"  id="btnOff"  type="button">OFF</button>
+      <button class="btn btn-warning" id="btnAuto" type="button">Toggle Auto</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>⚙️ Settings</h2>
+    <div class="settings-grid">
+      <div class="setting-item"><label for="dryValue">Dry ADC (air)</label>
+        <input type="number" id="dryValue" min="0" max="4095" step="1"
+               inputmode="numeric" value="3200" required></div>
+      <div class="setting-item"><label for="wetValue">Wet ADC (water)</label>
+        <input type="number" id="wetValue" min="0" max="4095" step="1"
+               inputmode="numeric" value="1400" required></div>
+      <div class="setting-item"><label for="threshold">Threshold (%)</label>
+        <input type="number" id="threshold" min="1" max="99" step="1"
+               inputmode="numeric" value="30" required></div>
+      <div class="setting-item"><label for="readInterval">Read Interval (s)</label>
+        <input type="number" id="readInterval" min="2" max="3600" step="1"
+               inputmode="numeric" value="5" required></div>
+    </div>
+    <div class="btn-group">
+      <button class="btn btn-primary" id="btnSave"    type="button">💾 Save</button>
+      <button class="btn btn-primary" id="btnRefresh" type="button">🔄 Refresh</button>
+    </div>
+  </div>
+
+  <div class="footer">ESP32 Soil Controller | <span id="ipAddr">--</span></div>
 </div>
 
-<div id="dashboard" class="tab-content active">
-<div class="dashboard">
-<div class="card">
-<h2>💧 Soil Moisture</h2>
-<div class="moisture-value" id="moistureValue">--%</div>
-<div class="moisture-bar"><div class="moisture-bar-fill" id="moistureBar" style="width:0%"></div></div>
-<div style="margin-top:15px;text-align:center;"><span class="status-badge" id="moistureStatus">Loading...</span></div>
-</div>
-<div class="card">
-<h2>🔌 Relay Status</h2>
-<div class="relay-indicator off" id="relayIndicator">⭕</div>
-<div style="text-align:center;"><span class="status-badge inactive" id="relayStatus">OFF</span></div>
-<div style="margin-top:15px;">
-<div class="info-row"><span class="info-label">Mode</span><span class="info-value" id="modeDisplay">Auto</span></div>
-<div class="info-row"><span class="info-label">Threshold</span><span class="info-value" id="thresholdDisplay">--%</span></div>
-<div class="info-row"><span class="info-label">Hysteresis</span><span class="info-value" id="hysteresisDisplay">--%</span></div>
-</div>
-</div>
-<div class="card">
-<h2>📶 System Info</h2>
-<div class="info-row"><span class="info-label">WiFi Mode</span><span class="info-value" id="wifiMode">--</span></div>
-<div class="info-row"><span class="info-label">IP Address</span><span class="info-value" id="ipAddress">--</span></div>
-<div class="info-row"><span class="info-label">Signal</span><span class="info-value" id="signalStrength">--</span></div>
-<div class="info-row"><span class="info-label">Uptime</span><span class="info-value" id="uptime">--</span></div>
-<div class="info-row"><span class="info-label">Free Heap</span><span class="info-value" id="freeMemory">--</span></div>
-<div class="info-row"><span class="info-label">Sensor</span><span class="info-value" id="sensorHealth">--</span></div>
-</div>
-</div>
-</div>
-
-<div id="control" class="tab-content">
-<div class="dashboard">
-<div class="card">
-<h2>🎛️ Relay Control</h2>
-<div class="relay-indicator off" id="relayIndicator2">⭕</div>
-<div style="text-align:center;margin-bottom:15px;"><span class="status-badge inactive" id="relayStatus2">OFF</span></div>
-<button class="btn btn-success" onclick="setRelay(true)">Turn ON</button>
-<button class="btn btn-danger" onclick="setRelay(false)" style="margin-top:10px;">Turn OFF</button>
-<button class="btn btn-primary" onclick="toggleRelay()" style="margin-top:10px;">Toggle</button>
-</div>
-<div class="card">
-<h2>🤖 Automation Mode</h2>
-<div style="text-align:center;margin:20px 0;"><span class="status-badge" id="autoModeStatus">Auto</span></div>
-<button class="btn btn-primary" onclick="setAutoMode(true)">Enable Auto</button>
-<button class="btn btn-warning" onclick="setAutoMode(false)" style="margin-top:10px;">Enable Manual</button>
-<div class="calibration-info" style="margin-top:20px;"><strong>ℹ️</strong> Relay ON when moisture &lt; threshold − hysteresis, OFF when &gt; threshold + hysteresis.</div>
-</div>
-</div>
-</div>
-
-<div id="settings" class="tab-content">
-<div class="dashboard">
-<div class="card">
-<h2>💧 Moisture Threshold</h2>
-<div class="range-value" id="thresholdValue">40%</div>
-<input type="range" id="thresholdSlider" min="5" max="95" value="40" oninput="document.getElementById('thresholdValue').textContent=this.value+'%'" style="width:100%;margin:20px 0;">
-<button class="btn btn-primary" onclick="saveThreshold()">Save Threshold</button>
-<div class="calibration-info">Relay activates when moisture drops below threshold (with hysteresis).</div>
-</div>
-<div class="card">
-<h2>📶 WiFi Settings</h2>
-<div class="settings-form">
-<div class="form-group"><label>WiFi SSID</label><input type="text" id="wifiSSID" placeholder="Enter WiFi name" maxlength="32"></div>
-<div class="form-group"><label>WiFi Password</label><input type="password" id="wifiPassword" placeholder="Enter WiFi password" maxlength="63"></div>
-<button class="btn btn-primary" onclick="saveWiFi()">Save &amp; Connect</button>
-<button class="btn btn-warning" onclick="resetWiFi()">Reset to AP Mode</button>
-</div>
-</div>
-</div>
-</div>
-
-<div id="calibration" class="tab-content">
-<div class="dashboard">
-<div class="card">
-<h2>📐 Sensor Calibration</h2>
-<p style="color:#aaa;margin-bottom:20px;font-size:0.9rem;">Place sensor in dry air → Save Dry. Place in water → Save Wet.</p>
-<div class="info-row"><span class="info-label">Current Raw</span><span class="info-value" id="rawValue">--</span></div>
-<div class="info-row"><span class="info-label">Dry Calibration</span><span class="info-value" id="dryCalValue">--</span></div>
-<div class="info-row"><span class="info-label">Wet Calibration</span><span class="info-value" id="wetCalValue">--</span></div>
-<button class="btn btn-warning" data-calib="1" onclick="saveCalibration('dry')" style="margin-top:15px;">📍 Save as Dry Point</button>
-<button class="btn btn-primary" data-calib="1" onclick="saveCalibration('wet')" style="margin-top:10px;">💧 Save as Wet Point</button>
-</div>
-<div class="card">
-<h2>🔧 Advanced Calibration</h2>
-<div class="settings-form">
-<div class="form-group"><label>Sensor Minimum (Dry)</label><input type="number" id="sensorMin" min="0" max="4095" value="4095"></div>
-<div class="form-group"><label>Sensor Maximum (Wet)</label><input type="number" id="sensorMax" min="0" max="4095" value="0"></div>
-<button class="btn btn-primary" onclick="saveAdvancedCalibration()">Save Advanced</button>
-</div>
-</div>
-</div>
-</div>
-</div>
-
-<div class="toast" id="toast">Settings saved!</div>
+<div class="toast" id="toast"></div>
 
 <script>
-let refreshInterval=null;
-let isRefreshing=false;
+'use strict';
 
-function showTab(el,name){
-  document.querySelectorAll('.tab-content').forEach(t=>t.classList.remove('active'));
-  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
-  document.getElementById(name).classList.add('active');
-  el.classList.add('active');
+const FETCH_TIMEOUT  = 5000;
+const POLL_MS        = 2000;
+const OFFLINE_MS     = 8000;
+const MAX_BACKOFF_MS = 30000;
+
+let currentAuto  = 1;
+let pollTimer    = null;
+let lastFetchOK  = Date.now();
+let failCount    = 0;
+let getInflight  = null;
+let postInflight = false;
+
+const $ = id => document.getElementById(id);
+const elMoisture  = $('moistureValue');
+const elRaw       = $('rawValue');
+const elThreshold = $('thresholdValue');
+const elBar       = $('moistureBar');
+const elRelayInd  = $('relayIndicator');
+const elModeBadge = $('modeBadge');
+const elOffline   = $('offlineBanner');
+const elToast     = $('toast');
+const elIP        = $('ipAddr');
+const elDry       = $('dryValue');
+const elWet       = $('wetValue');
+const elThr       = $('threshold');
+const elInt       = $('readInterval');
+const btnOn       = $('btnOn');
+const btnOff      = $('btnOff');
+const btnAuto     = $('btnAuto');
+const btnSave     = $('btnSave');
+const btnRefresh  = $('btnRefresh');
+
+const lastData = {
+  dryValue:null, wetValue:null,
+  threshold:null, readInterval:null
+};
+
+let toastTimer = null;
+function showToast(msg, type) {
+  elToast.textContent = msg;
+  elToast.className = 'toast show ' + (type || '');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    elToast.className = 'toast ' + (type || '');
+  }, 2200);
 }
 
-function showToast(msg,isError){
-  const t=document.getElementById('toast');
-  t.textContent=msg;
-  t.className='toast show'+(isError?' error':'');
-  clearTimeout(t._to);
-  t._to=setTimeout(()=>t.classList.remove('show'),3000);
-}
+function setBusy(el, busy) { if (el) el.disabled = !!busy; }
 
-async function api(path,opts){
-  const ctl=new AbortController();
-  const tm=setTimeout(()=>ctl.abort(),8000);
-  try{
-    const r=await fetch(path,Object.assign({},opts,{signal:ctl.signal}));
-    clearTimeout(tm);
-    let body=null;
-    try{body=await r.json();}catch(e){}
-    if(!r.ok){
-      const err=new Error((body&&body.error)||('HTTP '+r.status));
-      err.body=body;
-      throw err;
+async function doGet(url) {
+  if (getInflight) { try { getInflight.abort(); } catch(e){} }
+  const ctrl = new AbortController();
+  getInflight = ctrl;
+  const to = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal, cache:'no-store' });
+    clearTimeout(to);
+    if (!res.ok) {
+      let msg = 'HTTP ' + res.status;
+      try { const j = await res.json(); if (j && j.error) msg = j.error; } catch(e){}
+      throw new Error(msg);
     }
-    return body||{};
-  }catch(e){
-    clearTimeout(tm);
-    throw e;
+    const text = await res.text();
+    if (!text) throw new Error('Empty response');
+    try { return JSON.parse(text); }
+    catch(e) { throw new Error('Bad JSON'); }
+  } finally {
+    clearTimeout(to);
+    if (getInflight === ctrl) getInflight = null;
   }
 }
 
-async function refreshData(){
-  if(isRefreshing)return;
-  isRefreshing=true;
-  try{
-    const d=await api('/api/status');
-    updateUI(d);
-  }catch(e){}
-  finally{isRefreshing=false;}
-}
-
-function updateUI(d){
-  const mv=document.getElementById('moistureValue');
-  if(d.sensorFault){
-    mv.textContent='ERR';
-    mv.className='moisture-value dry';
-  } else {
-    mv.textContent=d.moisture+'%';
-    const band_lo=d.threshold-d.hysteresis;
-    const band_hi=d.threshold+d.hysteresis;
-    mv.className='moisture-value '+(d.moisture<band_lo?'dry':d.moisture<band_hi?'moderate':'wet');
-  }
-  document.getElementById('moistureBar').style.width=(d.sensorFault?0:d.moisture)+'%';
-
-  const ms=document.getElementById('moistureStatus');
-  if(d.sensorFault){
-    ms.textContent='SENSOR FAULT';
-    ms.className='status-badge inactive';
-  } else if(d.moisture<(d.threshold-d.hysteresis)){
-    ms.textContent='DRY - Needs Water';
-    ms.className='status-badge inactive';
-  } else if(d.moisture<(d.threshold+d.hysteresis)){
-    ms.textContent='MODERATE';
-    ms.className='status-badge warn';
-  } else {
-    ms.textContent='WET - Good';
-    ms.className='status-badge active';
-  }
-
-  ['relayIndicator','relayIndicator2'].forEach(id=>{
-    const el=document.getElementById(id);
-    if(el){el.className='relay-indicator '+(d.relay?'on':'off');el.textContent=d.relay?'💡':'⭕';}
-  });
-  ['relayStatus','relayStatus2'].forEach(id=>{
-    const el=document.getElementById(id);
-    if(el){el.textContent=d.relay?'ON':'OFF';el.className='status-badge '+(d.relay?'active':'inactive');}
-  });
-
-  document.getElementById('modeDisplay').textContent=d.autoMode?'Auto':'Manual';
-  const ams=document.getElementById('autoModeStatus');
-  ams.textContent=d.autoMode?'Auto Mode':'Manual Mode';
-  ams.className='status-badge '+(d.autoMode?'active':'inactive');
-
-  document.getElementById('thresholdDisplay').textContent=d.threshold+'%';
-  document.getElementById('hysteresisDisplay').textContent='±'+d.hysteresis+'%';
-
-  const ts=document.getElementById('thresholdSlider');
-  if(ts&&!ts.dataset.userEdited){ts.value=d.threshold;document.getElementById('thresholdValue').textContent=d.threshold+'%';}
-
-  document.getElementById('wifiMode').textContent=d.apMode?'Access Point':'Station';
-  document.getElementById('ipAddress').textContent=d.ip;
-  document.getElementById('signalStrength').textContent=d.apMode?'N/A (AP)':(d.rssi+' dBm');
-  document.getElementById('uptime').textContent=formatUptime(d.uptime);
-  document.getElementById('freeMemory').textContent=(d.freeHeap/1024).toFixed(1)+' KB';
-
-  const sh=document.getElementById('sensorHealth');
-  if(d.sensorFault){sh.textContent='FAULT';sh.style.color='#ff6b6b';}
-  else{sh.textContent='OK';sh.style.color='#00ff88';}
-
-  document.querySelectorAll('[data-calib="1"]').forEach(b=>{
-    b.disabled=!!d.sensorFault;
-    b.style.opacity=d.sensorFault?'0.4':'1';
-  });
-
-  document.getElementById('rawValue').textContent=d.rawValue;
-  document.getElementById('dryCalValue').textContent=d.calibrationDry;
-  document.getElementById('wetCalValue').textContent=d.calibrationWet;
-
-  const ws=document.getElementById('wifiSSID');
-  if(ws&&!ws.dataset.userEdited&&d.ssid&&!ws.value) ws.value=d.ssid;
-  const sm=document.getElementById('sensorMin');
-  if(sm&&!sm.dataset.userEdited) sm.value=d.sensorMin;
-  const sx=document.getElementById('sensorMax');
-  if(sx&&!sx.dataset.userEdited) sx.value=d.sensorMax;
-}
-
-function formatUptime(s){
-  const dd=Math.floor(s/86400), hh=Math.floor((s%86400)/3600), mm=Math.floor((s%3600)/60), ss=s%60;
-  if(dd>0)return dd+'d '+hh+'h '+mm+'m';
-  if(hh>0)return hh+'h '+mm+'m '+ss+'s';
-  if(mm>0)return mm+'m '+ss+'s';
-  return ss+'s';
-}
-
-async function setRelay(state){
-  try{
-    const d=await api('/api/relay',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({state})});
-    if(d.success){showToast('Relay '+(state?'ON':'OFF'));refreshData();}
-    else showToast('Failed',true);
-  }catch(e){showToast(e.message||'Connection error',true);}
-}
-
-async function toggleRelay(){
-  try{
-    const d=await api('/api/relay/toggle',{method:'POST'});
-    if(d.success){showToast('Relay toggled');refreshData();}
-  }catch(e){showToast(e.message||'Connection error',true);}
-}
-
-async function setAutoMode(enabled){
-  try{
-    const d=await api('/api/auto',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});
-    if(d.success){showToast('Auto '+(enabled?'enabled':'disabled'));refreshData();}
-  }catch(e){showToast(e.message||'Connection error',true);}
-}
-
-async function saveThreshold(){
-  const threshold=parseInt(document.getElementById('thresholdSlider').value,10);
-  try{
-    const d=await api('/api/threshold',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({threshold})});
-    if(d.success){showToast('Threshold saved: '+threshold+'%');refreshData();}
-  }catch(e){showToast(e.message||'Connection error',true);}
-}
-
-async function saveWiFi(){
-  const ssid=document.getElementById('wifiSSID').value.trim();
-  const password=document.getElementById('wifiPassword').value;
-  if(!ssid){showToast('Please enter WiFi SSID',true);return;}
-  if(ssid.length>32){showToast('SSID too long (max 32)',true);return;}
-  if(password.length>63){showToast('Password too long (max 63)',true);return;}
-  if(!confirm('Save WiFi and reboot device?'))return;
-  try{
-    const d=await api('/api/wifi',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid,password})});
-    if(d.success){showToast('Saved. Device will reboot...');}
-    else showToast('Save failed',true);
-  }catch(e){showToast(e.message||'Connection error',true);}
-}
-
-async function resetWiFi(){
-  if(!confirm('Reset WiFi to Access Point mode?'))return;
-  try{
-    const d=await api('/api/wifi/reset',{method:'POST'});
-    if(d.success)showToast('Rebooting to AP mode...');
-  }catch(e){showToast(e.message||'Connection error',true);}
-}
-
-async function saveCalibration(type){
-  try{
-    const d=await api('/api/calibrate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type})});
-    if(d.success){showToast(type==='dry'?'Dry calibration saved':'Wet calibration saved');refreshData();}
-    else showToast('Calibration rejected',true);
-  }catch(e){showToast(e.message||'Connection error',true);}
-}
-
-async function saveAdvancedCalibration(){
-  const min=parseInt(document.getElementById('sensorMin').value,10);
-  const max=parseInt(document.getElementById('sensorMax').value,10);
-  if(isNaN(min)||isNaN(max)||min<0||min>4095||max<0||max>4095){showToast('Values must be 0-4095',true);return;}
-  try{
-    const d=await api('/api/calibrate/advanced',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({min,max})});
-    if(d.success){showToast('Advanced calibration saved');refreshData();}
-  }catch(e){showToast(e.message||'Connection error',true);}
-}
-
-document.addEventListener('DOMContentLoaded',()=>{
-  ['wifiSSID','sensorMin','sensorMax','thresholdSlider'].forEach(id=>{
-    const el=document.getElementById(id);
-    if(!el)return;
-    el.addEventListener('input',()=>{el.dataset.userEdited='1';});
-    el.addEventListener('focus',()=>{
-      const t=el._editTimer;
-      if(t){clearTimeout(t);el._editTimer=null;}
+async function doPost(url, body) {
+  if (postInflight) throw new Error('Another save in progress');
+  postInflight = true;
+  const ctrl = new AbortController();
+  const to = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT);
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type':'application/json' },
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+      cache: 'no-store'
     });
-    el.addEventListener('blur',()=>{
-      const t=el._editTimer;
-      if(t)clearTimeout(t);
-      el._editTimer=setTimeout(()=>{delete el.dataset.userEdited;el._editTimer=null;},1500);
-    });
-  });
-  refreshData();
-  refreshInterval=setInterval(refreshData,3000);
+    clearTimeout(to);
+    const text = await res.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch(e){}
+    if (!res.ok) {
+      const msg = (data && data.error) ? data.error : ('HTTP ' + res.status);
+      throw new Error(msg);
+    }
+    return data;
+  } finally {
+    clearTimeout(to);
+    postInflight = false;
+  }
+}
+
+function updateUI(d) {
+  if (!d || typeof d !== 'object') return;
+
+  const pct = Number.isFinite(Number(d.moisture))
+            ? Math.max(0, Math.min(100, Number(d.moisture))) : 0;
+  elMoisture.textContent = pct + '%';
+  elRaw.textContent      = Number.isFinite(Number(d.raw)) ? d.raw : '--';
+  elThreshold.textContent= Number.isFinite(Number(d.threshold)) ? d.threshold : '--';
+
+  elBar.style.width = pct + '%';
+  elBar.style.background =
+    pct < 30 ? '#f44336' :
+    pct < 60 ? '#ff9800' : '#4CAF50';
+
+  elBar.textContent = (pct >= 15) ? (pct + '%') : '';
+
+  const relayOn = (d.relay === 1 || d.relay === true);
+  elRelayInd.textContent = relayOn ? 'ON' : 'OFF';
+  elRelayInd.className   = 'relay-indicator ' + (relayOn ? 'relay-on' : 'relay-off');
+
+  const auto = (d.auto === 1 || d.auto === true);
+  currentAuto = auto ? 1 : 0;
+  elModeBadge.textContent = auto ? 'AUTO' : 'MANUAL';
+  elModeBadge.className   = 'status-badge ' + (auto ? 'badge-auto' : 'badge-manual');
+
+  const pairs = [[elDry, d.dryValue],[elWet, d.wetValue],
+                 [elThr, d.threshold],[elInt, d.readInterval]];
+  for (const [el, val] of pairs) {
+    if (document.activeElement !== el && Number.isFinite(Number(val))) {
+      if (el.value !== String(val)) el.value = val;
+    }
+  }
+
+  if (Number.isFinite(Number(d.dryValue)))     lastData.dryValue     = Number(d.dryValue);
+  if (Number.isFinite(Number(d.wetValue)))     lastData.wetValue     = Number(d.wetValue);
+  if (Number.isFinite(Number(d.threshold)))    lastData.threshold    = Number(d.threshold);
+  if (Number.isFinite(Number(d.readInterval))) lastData.readInterval = Number(d.readInterval);
+
+  btnOn.disabled = btnOff.disabled = btnAuto.disabled = false;
+}
+
+async function fetchStatus(silent) {
+  try {
+    const d = await doGet('/status');
+    if (d) updateUI(d);
+    failCount = 0;
+    lastFetchOK = Date.now();
+    elOffline.classList.remove('show');
+  } catch (err) {
+    if (err.name === 'AbortError') return;
+    failCount++;
+    if (!silent) console.warn('Status:', err.message);
+    if (Date.now() - lastFetchOK > OFFLINE_MS) {
+      elOffline.classList.add('show');
+    }
+  }
+}
+
+function scheduleNextPoll() {
+  if (pollTimer) clearTimeout(pollTimer);
+  const base = POLL_MS;
+  const delay = failCount > 0
+    ? Math.min(base * Math.pow(2, failCount - 1), MAX_BACKOFF_MS)
+    : base;
+
+  pollTimer = setTimeout(async () => {
+    if (!document.hidden) await fetchStatus(true);
+    scheduleNextPoll();
+  }, delay);
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) {
+    failCount = 0;
+    fetchStatus(true);
+  }
 });
 
-window.addEventListener('beforeunload',()=>{if(refreshInterval)clearInterval(refreshInterval);});
+async function setRelay(state) {
+  if (state === 1) {
+    if (!confirm('Turn relay ON manually?\n\nThis switches to MANUAL mode.')) return;
+  }
+  setBusy(btnOn, true); setBusy(btnOff, true);
+  try {
+    const d = await doGet('/relay?state=' + state);
+    if (d) updateUI(d);
+    showToast('Relay ' + (state ? 'ON' : 'OFF'), 'success');
+  } catch (err) {
+    showToast('Relay error: ' + err.message, 'error');
+  } finally {
+    setBusy(btnOn, false); setBusy(btnOff, false);
+  }
+}
+
+async function toggleAuto() {
+  const next = currentAuto ? 0 : 1;
+  setBusy(btnAuto, true);
+  try {
+    const d = await doGet('/auto?state=' + next);
+    if (d) updateUI(d);
+    showToast('Mode: ' + (next ? 'AUTO' : 'MANUAL'), 'success');
+  } catch (err) {
+    showToast('Mode error: ' + err.message, 'error');
+  } finally {
+    setBusy(btnAuto, false);
+  }
+}
+
+async function saveSettings() {
+  const dv = Number(elDry.value.trim());
+  const wv = Number(elWet.value.trim());
+  const th = Number(elThr.value.trim());
+  const ri = Number(elInt.value.trim());
+
+  if (!Number.isInteger(dv) || !Number.isInteger(wv) ||
+      !Number.isInteger(th) || !Number.isInteger(ri)) {
+    showToast('Please enter whole numbers only', 'error');
+    return;
+  }
+
+  if (dv < 0 || dv > 4095) { showToast('Dry ADC must be 0-4095','error'); elDry.focus(); return; }
+  if (wv < 0 || wv > 4095) { showToast('Wet ADC must be 0-4095','error'); elWet.focus(); return; }
+  if (dv <= wv)            { showToast('Dry ADC must be > Wet ADC','error'); elDry.focus(); return; }
+  if (th < 1 || th > 99)   { showToast('Threshold 1-99','error'); elThr.focus(); return; }
+  if (ri < 2 || ri > 3600) { showToast('Interval 2-3600','error'); elInt.focus(); return; }
+
+  if (lastData.dryValue !== null &&
+      dv === lastData.dryValue && wv === lastData.wetValue &&
+      th === lastData.threshold && ri === lastData.readInterval) {
+    showToast('No changes to save');
+    return;
+  }
+
+  setBusy(btnSave, true);
+  try {
+    const d = await doPost('/settings', {
+      dryValue: dv, wetValue: wv, threshold: th, readInterval: ri
+    });
+    if (d) updateUI(d);
+    showToast('Settings saved ✓', 'success');
+  } catch (err) {
+    showToast('Save failed: ' + err.message, 'error');
+  } finally {
+    setBusy(btnSave, false);
+  }
+}
+
+btnOn.addEventListener('click',      () => setRelay(1));
+btnOff.addEventListener('click',     () => setRelay(0));
+btnAuto.addEventListener('click',    toggleAuto);
+btnSave.addEventListener('click',    saveSettings);
+btnRefresh.addEventListener('click', () => { failCount = 0; fetchStatus(false); });
+
+[elDry, elWet, elThr, elInt].forEach(el => {
+  el.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); saveSettings(); }
+  });
+});
+
+elIP.textContent = location.hostname || 'ESP32';
+btnOn.disabled = btnOff.disabled = btnAuto.disabled = true;
+fetchStatus(false).then(() => {
+  btnOn.disabled = btnOff.disabled = btnAuto.disabled = false;
+});
+scheduleNextPoll();
+
+window.addEventListener('beforeunload', () => {
+  if (pollTimer) clearTimeout(pollTimer);
+});
 </script>
 </body>
 </html>
-)rawliteral";
+)HTMLPAGE";
 
-void saveStringToEEPROM(int addr, const String& str, uint8_t maxLen) {
-  uint8_t len = str.length();
-  if (len > maxLen) len = maxLen;
-  EEPROM.write(addr, len);
-  for (uint8_t i = 0; i < len; i++) EEPROM.write(addr + 1 + i, str[i]);
-  EEPROM.write(addr + 1 + len, 0);
+// ==================== SETUP ====================
+void setup() {
+  analogReadResolution(12);
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  analogSetAttenuation(ADC_ATTEN_DB_11);
+#else
+  analogSetAttenuation(ADC_11db);
+#endif
+  pinMode(SOIL_MOISTURE_PIN, INPUT);
+
+  pinMode(RELAY_PIN, OUTPUT);
+#if RELAY_ACTIVE_LOW
+  digitalWrite(RELAY_PIN, HIGH);
+#else
+  digitalWrite(RELAY_PIN, LOW);
+#endif
+  setRelayHardware(false);
+
+  EEPROM.begin(EEPROM_SIZE);
+  loadSettings();
+
+  setupWiFi();
+
+  server.on("/",         HTTP_GET,  handleRoot);
+  server.on("/status",   HTTP_GET,  handleStatus);
+  server.on("/relay",    HTTP_GET,  handleRelay);
+  server.on("/auto",     HTTP_GET,  handleAuto);
+  server.on("/settings", HTTP_POST, handleSettings);
+  server.onNotFound(handleNotFound);
+  server.begin();
+
+  readSensor();
+  updateRelay();
+  lastReadTime = millis();
 }
 
-String readStringFromEEPROM(int addr, uint8_t maxLen) {
-  uint8_t len = EEPROM.read(addr);
-  if (len > maxLen) return "";
-  String s;
-  s.reserve(len);
-  for (uint8_t i = 0; i < len; i++) {
-    char c = EEPROM.read(addr + 1 + i);
-    if (c == 0) break;
-    s += c;
+// ==================== LOOP ====================
+void loop() {
+  server.handleClient();
+
+  unsigned long now = millis();
+
+  uint16_t interval = settings.readInterval;
+  if (interval < 2) interval = 2;
+  if (now - lastReadTime >= (unsigned long)interval * 1000UL) {
+    lastReadTime = now;
+    readSensor();
+    updateRelay();
   }
-  return s;
-}
 
-void saveIntToEEPROM(int addr, int value) {
-  EEPROM.write(addr,     (value >> 8) & 0xFF);
-  EEPROM.write(addr + 1,  value       & 0xFF);
-}
-
-int readIntFromEEPROM(int addr) {
-  return (EEPROM.read(addr) << 8) | EEPROM.read(addr + 1);
-}
-
-void saveBoolToEEPROM(int addr, bool value) { EEPROM.write(addr, value ? 1 : 0); }
-bool readBoolFromEEPROM(int addr)          { return EEPROM.read(addr) == 1; }
-
-void markEepromDirty() {
-  eepromDirty = true;
-  eepromDirtyAt = millis() + 500;
-}
-
-void serviceEeprom() {
-  if (eepromDirty && (long)(millis() - eepromDirtyAt) >= 0) {
-    eepromDirty = false;
-    EEPROM.commit();
+  if (!apModeActive && (now - lastWiFiCheck >= 15000UL)) {
+    lastWiFiCheck = now;
+    if (WiFi.status() != WL_CONNECTED) {
+      WiFi.disconnect();
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+    }
   }
+
+  delay(5);
+  yield();
 }
 
-void saveSettings() {
-  saveStringToEEPROM(ADDR_WIFI_SSID, wifiSSID,     WIFI_SSID_MAX);
-  saveStringToEEPROM(ADDR_WIFI_PASS, wifiPassword, WIFI_PASS_MAX);
-  saveIntToEEPROM(ADDR_MOISTURE_THRESHOLD, moistureThreshold);
-  saveBoolToEEPROM(ADDR_AUTO_MODE,         autoMode);
-  saveBoolToEEPROM(ADDR_RELAY_STATE,       relayState);
-  saveIntToEEPROM(ADDR_CALIBRATION_DRY,    calibrationDry);
-  saveIntToEEPROM(ADDR_CALIBRATION_WET,    calibrationWet);
-  saveIntToEEPROM(ADDR_SENSOR_MIN,         sensorMin);
-  saveIntToEEPROM(ADDR_SENSOR_MAX,         sensorMax);
-  EEPROM.commit();
-}
-
-void normalizeCalibration() {
-  if (calibrationDry < calibrationWet) {
-    int t = calibrationDry;
-    calibrationDry = calibrationWet;
-    calibrationWet = t;
+// ==================== SENSOR ====================
+void readSensor() {
+  const int SAMPLES = 16;
+  const int DISCARD = 4;
+  long sum = 0;
+  int count = 0;
+  for (int i = 0; i < SAMPLES; i++) {
+    int v = analogRead(SOIL_MOISTURE_PIN);
+    if (i >= DISCARD) { sum += v; count++; }
+    delayMicroseconds(200);
   }
-  if (calibrationDry < 0)    calibrationDry = 0;
-  if (calibrationDry > 4095) calibrationDry = 4095;
-  if (calibrationWet < 0)    calibrationWet = 0;
-  if (calibrationWet > 4095) calibrationWet = 4095;
-  if (calibrationDry == calibrationWet) {
-    calibrationDry = DEFAULT_CALIBRATION_DRY;
-    calibrationWet = DEFAULT_CALIBRATION_WET;
-  }
-}
+  int raw = count ? (int)(sum / count) : 0;
 
-void loadSettings() {
-  if (EEPROM.read(ADDR_MAGIC) == EEPROM_MAGIC_NUMBER) {
-    wifiSSID     = readStringFromEEPROM(ADDR_WIFI_SSID, WIFI_SSID_MAX);
-    wifiPassword = readStringFromEEPROM(ADDR_WIFI_PASS, WIFI_PASS_MAX);
-    moistureThreshold = readIntFromEEPROM(ADDR_MOISTURE_THRESHOLD);
-    autoMode          = readBoolFromEEPROM(ADDR_AUTO_MODE);
-    relayState        = readBoolFromEEPROM(ADDR_RELAY_STATE);
-    calibrationDry    = readIntFromEEPROM(ADDR_CALIBRATION_DRY);
-    calibrationWet    = readIntFromEEPROM(ADDR_CALIBRATION_WET);
-    sensorMin         = readIntFromEEPROM(ADDR_SENSOR_MIN);
-    sensorMax         = readIntFromEEPROM(ADDR_SENSOR_MAX);
+  int pct = calculateMoisture(raw);
 
-    if (moistureThreshold < 5 || moistureThreshold > 95) moistureThreshold = DEFAULT_MOISTURE_THRESHOLD;
-    if (sensorMin < 0 || sensorMin > 4095) sensorMin = DEFAULT_SENSOR_MIN;
-    if (sensorMax < 0 || sensorMax > 4095) sensorMax = DEFAULT_SENSOR_MAX;
+  static int  lastPct    = -1;
+  static int  stableRuns = 0;
 
-    String cleanSSID = "";
-    for (size_t i = 0; i < wifiSSID.length(); i++)
-      if (wifiSSID[i] >= 32 && wifiSSID[i] < 127) cleanSSID += wifiSSID[i];
-    wifiSSID = cleanSSID;
-
-    normalizeCalibration();
+  if (lastPct >= 0 && abs(pct - lastPct) > 40) {
+    stableRuns++;
+    if (stableRuns < 3) return;
   } else {
-    wifiSSID = "";
-    wifiPassword = "";
-    moistureThreshold = DEFAULT_MOISTURE_THRESHOLD;
-    autoMode          = true;
-    relayState        = false;
-    calibrationDry    = DEFAULT_CALIBRATION_DRY;
-    calibrationWet    = DEFAULT_CALIBRATION_WET;
-    sensorMin         = DEFAULT_SENSOR_MIN;
-    sensorMax         = DEFAULT_SENSOR_MAX;
-    EEPROM.write(ADDR_MAGIC, EEPROM_MAGIC_NUMBER);
-    saveSettings();
+    stableRuns = 0;
   }
+  lastPct = pct;
+
+  portENTER_CRITICAL(&g_mux);
+  g_rawMoisture     = raw;
+  g_moisturePercent = pct;
+  portEXIT_CRITICAL(&g_mux);
 }
 
-inline void relayWrite(bool on) {
+int calculateMoisture(int raw) {
+  int dry = settings.dryValue;
+  int wet = settings.wetValue;
+
+  if (dry <= wet) return 0;
+
+  if (raw >= dry) return 0;
+  if (raw <= wet) return 100;
+
+  float pct = 100.0f * (float)(dry - raw) / (float)(dry - wet);
+
+  if (pct < 0.0f)   pct = 0.0f;
+  if (pct > 100.0f) pct = 100.0f;
+  return (int)(pct + 0.5f);
+}
+
+void setRelayHardware(bool on) {
 #if RELAY_ACTIVE_LOW
   digitalWrite(RELAY_PIN, on ? LOW : HIGH);
 #else
@@ -591,429 +611,219 @@ inline void relayWrite(bool on) {
 #endif
 }
 
-int readMoistureRaw() {
-  const int N = 9;
-  int samples[N];
-  for (int i = 0; i < N; i++) {
-    samples[i] = analogRead(SOIL_MOISTURE_PIN);
-    delay(3);
-  }
-  for (int i = 1; i < N; i++) {
-    int k = samples[i];
-    int j = i - 1;
-    while (j >= 0 && samples[j] > k) {
-      samples[j + 1] = samples[j];
-      j--;
+void updateRelay() {
+  static unsigned long relayOnSince = 0;
+  static bool          maxTrip      = false;
+
+  bool newState;
+
+  if (settings.autoMode == 1) {
+    int pct = g_moisturePercent;
+    newState = (pct < settings.threshold);
+
+    if (newState && !g_relayActive) {
+      relayOnSince = millis();
+      maxTrip = false;
     }
-    samples[j + 1] = k;
-  }
-  return samples[N / 2];
-}
-
-int calculateMoisturePercent(int rawValue) {
-  int dryValue = calibrationDry;
-  int wetValue = calibrationWet;
-  if (dryValue < wetValue) {
-    int t = dryValue;
-    dryValue = wetValue;
-    wetValue = t;
-  }
-  int range = dryValue - wetValue;
-  if (range <= 0) return 0;
-  if (rawValue > dryValue) rawValue = dryValue;
-  if (rawValue < wetValue) rawValue = wetValue;
-  long percent = (long)(rawValue - wetValue) * 100L / range;
-  if (percent < 0)   percent = 0;
-  if (percent > 100) percent = 100;
-  return (int)percent;
-}
-
-int getSmoothedMoisture() {
-  moistureReadings[readingIndex] = moisturePercent;
-  readingIndex = (readingIndex + 1) % SMOOTHING_SAMPLES;
-  long sum = 0;
-  for (int i = 0; i < SMOOTHING_SAMPLES; i++) sum += moistureReadings[i];
-  return sum / SMOOTHING_SAMPLES;
-}
-
-void updateSensorReadings() {
-  rawMoistureValue = readMoistureRaw();
-
-  if (rawMoistureValue <= 5 || rawMoistureValue >= 4090) {
-    if (sensorRailCount < 255) sensorRailCount++;
+    if (newState && (millis() - relayOnSince > 300000UL)) {
+      newState = false;
+      maxTrip = true;
+    }
   } else {
-    sensorRailCount = 0;
-    sensorFault = false;
+    newState = (settings.relayState == 1);
+    maxTrip = false;
   }
-  if (sensorRailCount >= SENSOR_FAULT_RAIL) sensorFault = true;
 
-  moisturePercent  = calculateMoisturePercent(rawMoistureValue);
-  smoothedMoisture = getSmoothedMoisture();
-}
-
-void setRelayState(bool state, bool persist) {
-  if (state == relayState && !persist) return;
-  relayState = state;
-  relayWrite(state);
-  if (persist) {
-    saveBoolToEEPROM(ADDR_RELAY_STATE, relayState);
-    markEepromDirty();
+  if (newState != g_relayActive) {
+    setRelayHardware(newState);
+    g_relayActive = newState;
   }
 }
 
-void handleAutoMode() {
-  if (!autoMode || sensorFault) return;
-
-  bool shouldBeOn;
-  if (relayState) {
-    shouldBeOn = (smoothedMoisture < (moistureThreshold + AUTO_HYSTERESIS));
-  } else {
-    shouldBeOn = (smoothedMoisture < (moistureThreshold - AUTO_HYSTERESIS));
+// ==================== SETTINGS ====================
+uint16_t calcCRC(const Settings& s) {
+  const uint8_t* p = (const uint8_t*)&s;
+  uint16_t c = 0xFFFF;
+  for (size_t i = 0; i < sizeof(Settings) - sizeof(uint16_t); i++) {
+    c ^= p[i];
+    for (int j = 0; j < 8; j++)
+      c = (c & 1) ? (c >> 1) ^ 0xA001 : (c >> 1);
   }
+  return c;
+}
 
-  if (shouldBeOn != relayState) {
-    setRelayState(shouldBeOn, false);
+void loadSettings() {
+  EEPROM.get(SETTINGS_ADDR, settings);
+
+  bool valid = (settings.magic == SETTINGS_MAGIC)
+            && (settings.dryValue <= 4095)
+            && (settings.wetValue <= 4095)
+            && (settings.dryValue > settings.wetValue)
+            && (settings.threshold >= 1 && settings.threshold <= 99)
+            && (settings.readInterval >= 2 && settings.readInterval <= 3600)
+            && (settings.autoMode <= 1)
+            && (settings.relayState <= 1)
+            && (settings.crc == calcCRC(settings));
+
+  if (!valid) {
+    settings.magic        = SETTINGS_MAGIC;
+    settings.dryValue     = 3200;
+    settings.wetValue     = 1400;
+    settings.threshold    = 30;
+    settings.autoMode     = 1;
+    settings.relayState   = 0;
+    settings.readInterval = 5;
+    settings.crc          = calcCRC(settings);
+    saveSettings();
   }
 }
 
-void startAPMode() {
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASSWORD);
-  apMode = true;
-  wifiState = WIFI_STATE_AP;
+void saveSettings() {
+  settings.magic = SETTINGS_MAGIC;
+  settings.crc   = calcCRC(settings);
+  EEPROM.put(SETTINGS_ADDR, settings);
+  EEPROM.commit();
 }
 
-void beginWifiConnect() {
-  if (wifiSSID.length() == 0) {
-    startAPMode();
-    return;
-  }
+// ==================== WIFI ====================
+void setupWiFi() {
+  WiFi.persistent(false);
+  WiFi.setSleep(false);
   WiFi.mode(WIFI_STA);
-  WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
-  wifiState = WIFI_STATE_CONNECTING;
-  wifiConnectStart = millis();
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+    delay(300);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    apModeActive = false;
+  } else {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(AP_SSID, AP_PASS);
+    apModeActive = true;
+  }
 }
 
-void serviceWifi() {
-  switch (wifiState) {
-    case WIFI_STATE_CONNECTING:
-      if (WiFi.status() == WL_CONNECTED) {
-        wifiState = WIFI_STATE_CONNECTED;
-        apMode = false;
-      } else if (millis() - wifiConnectStart > WIFI_CONNECT_TIMEOUT) {
-        WiFi.disconnect(true);
-        startAPMode();
-      }
-      break;
+// ==================== SNAPSHOT ====================
+void snapshot(int &rawOut, int &pctOut, bool &relayOut,
+              uint8_t &autoOut, uint8_t &thrOut) {
+  portENTER_CRITICAL(&g_mux);
+  rawOut   = g_rawMoisture;
+  pctOut   = g_moisturePercent;
+  relayOut = g_relayActive;
+  portEXIT_CRITICAL(&g_mux);
+  autoOut  = settings.autoMode;
+  thrOut   = settings.threshold;
+}
 
-    case WIFI_STATE_CONNECTED:
-      if (WiFi.status() != WL_CONNECTED) {
-        beginWifiConnect();
-      }
-      break;
-
-    default:
-      break;
-  }
+// ==================== WEB HANDLERS ====================
+void handleRoot() {
+  server.send_P(200, "text/html", INDEX_HTML);
 }
 
 void handleStatus() {
-  char buf[640];
-  String ipStr = apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
-  int rssi = apMode ? 0 : WiFi.RSSI();
+  int raw, pct; bool relay; uint8_t autoM, thr;
+  snapshot(raw, pct, relay, autoM, thr);
 
-  String safeSSID;
-  safeSSID.reserve(wifiSSID.length() + 8);
-  for (size_t i = 0; i < wifiSSID.length(); i++) {
-    char c = wifiSSID[i];
-    if (c == '"' || c == '\\') {
-      safeSSID += '\\';
-      safeSSID += c;
-    } else {
-      safeSSID += c;
-    }
-  }
-
-  snprintf(buf, sizeof(buf),
-    "{\"moisture\":%d,\"rawValue\":%d,\"relay\":%s,\"autoMode\":%s,"
-    "\"threshold\":%d,\"hysteresis\":%d,\"apMode\":%s,\"ip\":\"%s\","
-    "\"ssid\":\"%s\",\"rssi\":%d,\"uptime\":%lu,\"freeHeap\":%u,"
-    "\"sensorFault\":%s,\"calibrationDry\":%d,\"calibrationWet\":%d,"
-    "\"sensorMin\":%d,\"sensorMax\":%d}",
-    smoothedMoisture, rawMoistureValue,
-    relayState ? "true" : "false",
-    autoMode   ? "true" : "false",
-    moistureThreshold, AUTO_HYSTERESIS,
-    apMode ? "true" : "false",
-    ipStr.c_str(), safeSSID.c_str(),
-    rssi, (unsigned long)(millis() / 1000), (unsigned)ESP.getFreeHeap(),
-    sensorFault ? "true" : "false",
-    calibrationDry, calibrationWet, sensorMin, sensorMax);
-
-  server.send(200, "application/json", buf);
-}
-
-bool jsonGetInt(const String& body, const char* key, int& out) {
-  String needle = String("\"") + key + "\"";
-  int k = body.indexOf(needle);
-  if (k < 0) return false;
-  int colon = body.indexOf(':', k + needle.length());
-  if (colon < 0) return false;
-  int i = colon + 1;
-  while (i < (int)body.length() && isspace(body[i])) i++;
-  int start = i;
-  if (i < (int)body.length() && body[i] == '-') i++;
-  while (i < (int)body.length() && isdigit(body[i])) i++;
-  if (i == start) return false;
-  if (i == start + 1 && body[start] == '-') return false;
-  out = body.substring(start, i).toInt();
-  return true;
-}
-
-bool jsonGetBool(const String& body, const char* key, bool& out) {
-  String needle = String("\"") + key + "\"";
-  int k = body.indexOf(needle);
-  if (k < 0) return false;
-  int colon = body.indexOf(':', k + needle.length());
-  if (colon < 0) return false;
-  int i = colon + 1;
-  while (i < (int)body.length() && isspace(body[i])) i++;
-  if (body.substring(i, i + 4) == "true")  { out = true;  return true; }
-  if (body.substring(i, i + 5) == "false") { out = false; return true; }
-  return false;
-}
-
-bool jsonGetString(const String& body, const char* key, String& out) {
-  String needle = String("\"") + key + "\"";
-  int k = body.indexOf(needle);
-  if (k < 0) return false;
-  int colon = body.indexOf(':', k + needle.length());
-  if (colon < 0) return false;
-  int q1 = body.indexOf('"', colon + 1);
-  if (q1 < 0) return false;
-  String val;
-  for (int i = q1 + 1; i < (int)body.length(); i++) {
-    char c = body[i];
-    if (c == '\\' && i + 1 < (int)body.length()) {
-      char n = body[i + 1];
-      if (n == '"')       { val += '"';  i++; continue; }
-      if (n == '\\')      { val += '\\'; i++; continue; }
-      if (n == 'n')       { val += '\n'; i++; continue; }
-      if (n == 'r')       { val += '\r'; i++; continue; }
-      if (n == 't')       { val += '\t'; i++; continue; }
-      val += c;
-      continue;
-    }
-    if (c == '"') {
-      out = val;
-      return true;
-    }
-    val += c;
-  }
-  return false;
-}
-
-void sendOK() {
-  server.send(200, "application/json", "{\"success\":true}");
-}
-
-void sendErr(const char* msg) {
-  String r = String("{\"success\":false,\"error\":\"") + msg + "\"}";
-  server.send(400, "application/json", r);
+  String json = "{";
+  json += "\"moisture\":"    + String(pct)                  + ",";
+  json += "\"raw\":"         + String(raw)                  + ",";
+  json += "\"relay\":"       + String(relay ? 1 : 0)        + ",";
+  json += "\"auto\":"        + String(autoM)                + ",";
+  json += "\"threshold\":"   + String(thr)                  + ",";
+  json += "\"dryValue\":"    + String(settings.dryValue)    + ",";
+  json += "\"wetValue\":"    + String(settings.wetValue)    + ",";
+  json += "\"readInterval\":"+ String(settings.readInterval);
+  json += "}";
+  server.send(200, "application/json", json);
 }
 
 void handleRelay() {
-  if (!server.hasArg("plain")) { sendErr("No body"); return; }
-  bool st;
-  if (!jsonGetBool(server.arg("plain"), "state", st)) { sendErr("No state"); return; }
+  if (server.hasArg("state")) {
+    int s = server.arg("state").toInt();
+    settings.autoMode   = 0;
+    settings.relayState = (s == 1) ? 1 : 0;
+    saveSettings();
 
-  if (st != relayState) {
-    if (autoMode) {
-      autoMode = false;
-      saveBoolToEEPROM(ADDR_AUTO_MODE, autoMode);
-      markEepromDirty();
+    bool newState = (settings.relayState == 1);
+    if (newState != g_relayActive) {
+      setRelayHardware(newState);
+      g_relayActive = newState;
     }
-    setRelayState(st, true);
   }
-  sendOK();
-}
-
-void handleRelayToggle() {
-  bool st = !relayState;
-  if (autoMode) {
-    autoMode = false;
-    saveBoolToEEPROM(ADDR_AUTO_MODE, autoMode);
-    markEepromDirty();
-  }
-  setRelayState(st, true);
-  sendOK();
+  handleStatus();
 }
 
 void handleAuto() {
-  if (!server.hasArg("plain")) { sendErr("No body"); return; }
-  bool en;
-  if (!jsonGetBool(server.arg("plain"), "enabled", en)) { sendErr("No enabled"); return; }
-  autoMode = en;
-  saveBoolToEEPROM(ADDR_AUTO_MODE, autoMode);
-  markEepromDirty();
-  if (en) handleAutoMode();
-  sendOK();
+  if (server.hasArg("state")) {
+    int s = server.arg("state").toInt();
+    settings.autoMode = (s == 1) ? 1 : 0;
+    if (settings.autoMode == 0) {
+      settings.relayState = g_relayActive ? 1 : 0;
+    }
+    saveSettings();
+    updateRelay();
+  }
+  handleStatus();
 }
 
-void handleThreshold() {
-  if (!server.hasArg("plain")) { sendErr("No body"); return; }
-  int v;
-  if (!jsonGetInt(server.arg("plain"), "threshold", v)) { sendErr("No threshold"); return; }
-  if (v < 5)  v = 5;
-  if (v > 95) v = 95;
-  moistureThreshold = v;
-  saveIntToEEPROM(ADDR_MOISTURE_THRESHOLD, moistureThreshold);
-  markEepromDirty();
-  sendOK();
-}
-
-void handleWiFi() {
-  if (!server.hasArg("plain")) { sendErr("No body"); return; }
-  String ssid, pass;
-  if (!jsonGetString(server.arg("plain"), "ssid", ssid)) { sendErr("No ssid"); return; }
-  jsonGetString(server.arg("plain"), "password", pass);
-  if (ssid.length() == 0 || ssid.length() > WIFI_SSID_MAX) { sendErr("Invalid SSID"); return; }
-  if (pass.length() > WIFI_PASS_MAX) { sendErr("Password too long"); return; }
-
-  wifiSSID = ssid;
-  wifiPassword = pass;
-  saveSettings();
-
-  sendOK();
-  pendingRestart = true;
-  pendingRestartAt = millis() + 1500;
-}
-
-void handleWiFiReset() {
-  wifiSSID = "";
-  wifiPassword = "";
-  saveSettings();
-  sendOK();
-  pendingRestart = true;
-  pendingRestartAt = millis() + 1500;
-}
-
-void handleCalibrate() {
-  if (!server.hasArg("plain")) { sendErr("No body"); return; }
-  if (sensorFault) { sendErr("Sensor fault"); return; }
-  String type;
-  if (!jsonGetString(server.arg("plain"), "type", type)) { sendErr("No type"); return; }
-
-  if (type == "dry") {
-    calibrationDry = rawMoistureValue;
-  } else if (type == "wet") {
-    calibrationWet = rawMoistureValue;
-  } else {
-    sendErr("Invalid type");
+void handleSettings() {
+  if (!server.hasArg("plain")) {
+    server.send(400, "application/json", "{\"error\":\"no body\"}");
     return;
   }
-  normalizeCalibration();
-  sensorMin = calibrationDry;
-  sensorMax = calibrationWet;
-  saveIntToEEPROM(ADDR_CALIBRATION_DRY, calibrationDry);
-  saveIntToEEPROM(ADDR_CALIBRATION_WET, calibrationWet);
-  saveIntToEEPROM(ADDR_SENSOR_MIN,      sensorMin);
-  saveIntToEEPROM(ADDR_SENSOR_MAX,      sensorMax);
-  markEepromDirty();
-  sendOK();
-}
 
-void handleAdvancedCalibration() {
-  if (!server.hasArg("plain")) { sendErr("No body"); return; }
-  int mn, mx;
-  if (!jsonGetInt(server.arg("plain"), "min", mn)) { sendErr("No min"); return; }
-  if (!jsonGetInt(server.arg("plain"), "max", mx)) { sendErr("No max"); return; }
-  if (mn < 0 || mn > 4095 || mx < 0 || mx > 4095 || mn == mx) { sendErr("Invalid range"); return; }
+  String body = server.arg("plain");
 
-  calibrationDry = mn;
-  calibrationWet = mx;
-  normalizeCalibration();
-  sensorMin = calibrationDry;
-  sensorMax = calibrationWet;
+  auto extract = [&](const char* key, long def)->long {
+    String k = String("\"") + key + "\":";
+    int i = body.indexOf(k);
+    if (i < 0) return def;
+    i += k.length();
+    while (i < (int)body.length() && (body[i]==' '||body[i]=='\t')) i++;
+    long v = 0; bool neg = false;
+    if (i < (int)body.length() && body[i]=='-'){neg=true;i++;}
+    bool found = false;
+    while (i < (int)body.length() && isdigit((unsigned char)body[i])) {
+      v = v*10 + (body[i]-'0'); i++; found = true;
+    }
+    return found ? (neg?-v:v) : def;
+  };
 
-  saveIntToEEPROM(ADDR_SENSOR_MIN,      sensorMin);
-  saveIntToEEPROM(ADDR_SENSOR_MAX,      sensorMax);
-  saveIntToEEPROM(ADDR_CALIBRATION_DRY, calibrationDry);
-  saveIntToEEPROM(ADDR_CALIBRATION_WET, calibrationWet);
-  markEepromDirty();
-  sendOK();
-}
+  long dv  = extract("dryValue",     settings.dryValue);
+  long wv  = extract("wetValue",     settings.wetValue);
+  long th  = extract("threshold",    settings.threshold);
+  long ri  = extract("readInterval", settings.readInterval);
 
-void handleFavicon() {
-  server.send(204, "text/plain", "");
+  if (dv < 0 || dv > 4095 || wv < 0 || wv > 4095 || dv <= wv) {
+    server.send(400, "application/json",
+                "{\"error\":\"invalid dry/wet (dry must be > wet, 0-4095)\"}");
+    return;
+  }
+  if (th < 1 || th > 99) {
+    server.send(400, "application/json",
+                "{\"error\":\"threshold must be 1-99\"}");
+    return;
+  }
+  if (ri < 2 || ri > 3600) {
+    server.send(400, "application/json",
+                "{\"error\":\"readInterval must be 2-3600\"}");
+    return;
+  }
+
+  settings.dryValue     = (uint16_t)dv;
+  settings.wetValue     = (uint16_t)wv;
+  settings.threshold    = (uint8_t)th;
+  settings.readInterval = (uint16_t)ri;
+  saveSettings();
+
+  readSensor();
+  updateRelay();
+  handleStatus();
 }
 
 void handleNotFound() {
-  server.send(404, "text/plain", "Not Found");
-}
-
-void setup() {
-  pinMode(RELAY_PIN, OUTPUT);
-#if RELAY_ACTIVE_LOW
-  digitalWrite(RELAY_PIN, HIGH);
-#else
-  digitalWrite(RELAY_PIN, LOW);
-#endif
-  pinMode(SOIL_MOISTURE_PIN, INPUT);
-
-  EEPROM.begin(EEPROM_SIZE);
-  loadSettings();
-
-  relayWrite(relayState);
-
-  rawMoistureValue = readMoistureRaw();
-  moisturePercent  = calculateMoisturePercent(rawMoistureValue);
-  for (int i = 0; i < SMOOTHING_SAMPLES; i++) moistureReadings[i] = moisturePercent;
-  smoothedMoisture = moisturePercent;
-
-  beginWifiConnect();
-
-  server.on("/",                        HTTP_GET,  []() { server.send_P(200, "text/html", INDEX_HTML); });
-  server.on("/favicon.ico",             HTTP_GET,  handleFavicon);
-  server.on("/api/status",              HTTP_GET,  handleStatus);
-  server.on("/api/relay",               HTTP_POST, handleRelay);
-  server.on("/api/relay/toggle",        HTTP_POST, handleRelayToggle);
-  server.on("/api/auto",                HTTP_POST, handleAuto);
-  server.on("/api/threshold",           HTTP_POST, handleThreshold);
-  server.on("/api/wifi",                HTTP_POST, handleWiFi);
-  server.on("/api/wifi/reset",          HTTP_POST, handleWiFiReset);
-  server.on("/api/calibrate",           HTTP_POST, handleCalibrate);
-  server.on("/api/calibrate/advanced",  HTTP_POST, handleAdvancedCalibration);
-  server.onNotFound(handleNotFound);
-
-  server.begin();
-}
-
-void loop() {
-  server.handleClient();
-  serviceWifi();
-  serviceEeprom();
-
-  unsigned long now = millis();
-
-  if (now - lastSensorRead >= SENSOR_INTERVAL) {
-    lastSensorRead = now;
-    updateSensorReadings();
-    handleAutoMode();
-  }
-
-  if (now - lastWiFiCheck >= WIFI_CHECK_INTERVAL) {
-    lastWiFiCheck = now;
-    if (wifiState == WIFI_STATE_CONNECTED && WiFi.status() != WL_CONNECTED) {
-      beginWifiConnect();
-    }
-  }
-
-  if (pendingRestart && (long)(now - pendingRestartAt) >= 0) {
-    if (eepromDirty) EEPROM.commit();
-    delay(100);
-    ESP.restart();
-  }
-
-  delay(2);
+  server.send(404, "text/plain", "404 Not Found");
 }
