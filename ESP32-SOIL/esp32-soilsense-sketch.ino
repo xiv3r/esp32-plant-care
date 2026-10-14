@@ -102,14 +102,15 @@ h1{text-align:center;margin-bottom:30px;font-size:2rem;background:linear-gradien
 .status-badge.inactive{background:rgba(255,107,107,0.2);color:#ff6b6b;border:1px solid #ff6b6b}
 .status-badge.warn{background:rgba(255,217,61,0.2);color:#ffd93d;border:1px solid #ffd93d}
 .btn{padding:12px 24px;border:none;border-radius:10px;cursor:pointer;font-size:1rem;font-weight:600;transition:all 0.3s ease;width:100%;margin-top:10px}
+.btn:disabled{cursor:not-allowed}
 .btn-primary{background:linear-gradient(135deg,#00d4ff,#0099cc);color:#fff}
-.btn-primary:hover{background:linear-gradient(135deg,#00e5ff,#00aadd);box-shadow:0 5px 20px rgba(0,212,255,0.4)}
+.btn-primary:hover:not(:disabled){background:linear-gradient(135deg,#00e5ff,#00aadd);box-shadow:0 5px 20px rgba(0,212,255,0.4)}
 .btn-danger{background:linear-gradient(135deg,#ff6b6b,#cc5555);color:#fff}
-.btn-danger:hover{background:linear-gradient(135deg,#ff7b7b,#dd6666);box-shadow:0 5px 20px rgba(255,107,107,0.4)}
+.btn-danger:hover:not(:disabled){background:linear-gradient(135deg,#ff7b7b,#dd6666);box-shadow:0 5px 20px rgba(255,107,107,0.4)}
 .btn-success{background:linear-gradient(135deg,#00ff88,#00cc6a);color:#1a1a2e}
-.btn-success:hover{background:linear-gradient(135deg,#00ff99,#00dd7b);box-shadow:0 5px 20px rgba(0,255,136,0.4)}
+.btn-success:hover:not(:disabled){background:linear-gradient(135deg,#00ff99,#00dd7b);box-shadow:0 5px 20px rgba(0,255,136,0.4)}
 .btn-warning{background:linear-gradient(135deg,#ffd93d,#ccad30);color:#1a1a2e}
-.btn-warning:hover{background:linear-gradient(135deg,#ffe94d,#ddbd40);box-shadow:0 5px 20px rgba(255,217,61,0.4)}
+.btn-warning:hover:not(:disabled){background:linear-gradient(135deg,#ffe94d,#ddbd40);box-shadow:0 5px 20px rgba(255,217,61,0.4)}
 .settings-form{display:flex;flex-direction:column;gap:15px}
 .form-group{display:flex;flex-direction:column;gap:5px}
 .form-group label{font-size:0.9rem;color:#aaa}
@@ -122,7 +123,7 @@ h1{text-align:center;margin-bottom:30px;font-size:2rem;background:linear-gradien
 .info-row:last-child{border-bottom:none}
 .info-label{color:#aaa}
 .info-value{font-weight:600}
-.toast{position:fixed;bottom:30px;left:50%;transform:translateX(-50%) translateY(100px);background:rgba(0,255,136,0.9);color:#1a1a2e;padding:15px 30px;border-radius:10px;font-weight:600;opacity:0;transition:all 0.3s ease;z-index:1000}
+.toast{position:fixed;bottom:30px;left:50%;transform:translateX(-50%) translateY(100px);background:rgba(0,255,136,0.9);color:#1a1a2e;padding:15px 30px;border-radius:10px;font-weight:600;opacity:0;transition:all 0.3s ease;z-index:1000;max-width:90vw;text-align:center}
 .toast.show{transform:translateX(-50%) translateY(0);opacity:1}
 .toast.error{background:rgba(255,107,107,0.9);color:#fff}
 .tabs{display:flex;gap:10px;margin-bottom:20px;flex-wrap:wrap}
@@ -227,8 +228,8 @@ h1{text-align:center;margin-bottom:30px;font-size:2rem;background:linear-gradien
 <div class="info-row"><span class="info-label">Current Raw</span><span class="info-value" id="rawValue">--</span></div>
 <div class="info-row"><span class="info-label">Dry Calibration</span><span class="info-value" id="dryCalValue">--</span></div>
 <div class="info-row"><span class="info-label">Wet Calibration</span><span class="info-value" id="wetCalValue">--</span></div>
-<button class="btn btn-warning" onclick="saveCalibration('dry')" style="margin-top:15px;">📍 Save as Dry Point</button>
-<button class="btn btn-primary" onclick="saveCalibration('wet')" style="margin-top:10px;">💧 Save as Wet Point</button>
+<button class="btn btn-warning" data-calib="1" onclick="saveCalibration('dry')" style="margin-top:15px;">📍 Save as Dry Point</button>
+<button class="btn btn-primary" data-calib="1" onclick="saveCalibration('wet')" style="margin-top:10px;">💧 Save as Wet Point</button>
 </div>
 <div class="card">
 <h2>🔧 Advanced Calibration</h2>
@@ -264,9 +265,23 @@ function showToast(msg,isError){
 }
 
 async function api(path,opts){
-  const r=await fetch(path,opts);
-  if(!r.ok) throw new Error('HTTP '+r.status);
-  return r.json();
+  const ctl=new AbortController();
+  const tm=setTimeout(()=>ctl.abort(),8000);
+  try{
+    const r=await fetch(path,Object.assign({},opts,{signal:ctl.signal}));
+    clearTimeout(tm);
+    let body=null;
+    try{body=await r.json();}catch(e){}
+    if(!r.ok){
+      const err=new Error((body&&body.error)||('HTTP '+r.status));
+      err.body=body;
+      throw err;
+    }
+    return body||{};
+  }catch(e){
+    clearTimeout(tm);
+    throw e;
+  }
 }
 
 async function refreshData(){
@@ -286,7 +301,9 @@ function updateUI(d){
     mv.className='moisture-value dry';
   } else {
     mv.textContent=d.moisture+'%';
-    mv.className='moisture-value '+(d.moisture<30?'dry':d.moisture<60?'moderate':'wet');
+    const band_lo=d.threshold-d.hysteresis;
+    const band_hi=d.threshold+d.hysteresis;
+    mv.className='moisture-value '+(d.moisture<band_lo?'dry':d.moisture<band_hi?'moderate':'wet');
   }
   document.getElementById('moistureBar').style.width=(d.sensorFault?0:d.moisture)+'%';
 
@@ -294,10 +311,10 @@ function updateUI(d){
   if(d.sensorFault){
     ms.textContent='SENSOR FAULT';
     ms.className='status-badge inactive';
-  } else if(d.moisture<30){
+  } else if(d.moisture<(d.threshold-d.hysteresis)){
     ms.textContent='DRY - Needs Water';
     ms.className='status-badge inactive';
-  } else if(d.moisture<60){
+  } else if(d.moisture<(d.threshold+d.hysteresis)){
     ms.textContent='MODERATE';
     ms.className='status-badge warn';
   } else {
@@ -323,7 +340,7 @@ function updateUI(d){
   document.getElementById('hysteresisDisplay').textContent='±'+d.hysteresis+'%';
 
   const ts=document.getElementById('thresholdSlider');
-  if(document.activeElement!==ts){ts.value=d.threshold;document.getElementById('thresholdValue').textContent=d.threshold+'%';}
+  if(ts&&!ts.dataset.userEdited){ts.value=d.threshold;document.getElementById('thresholdValue').textContent=d.threshold+'%';}
 
   document.getElementById('wifiMode').textContent=d.apMode?'Access Point':'Station';
   document.getElementById('ipAddress').textContent=d.ip;
@@ -335,16 +352,21 @@ function updateUI(d){
   if(d.sensorFault){sh.textContent='FAULT';sh.style.color='#ff6b6b';}
   else{sh.textContent='OK';sh.style.color='#00ff88';}
 
+  document.querySelectorAll('[data-calib="1"]').forEach(b=>{
+    b.disabled=!!d.sensorFault;
+    b.style.opacity=d.sensorFault?'0.4':'1';
+  });
+
   document.getElementById('rawValue').textContent=d.rawValue;
   document.getElementById('dryCalValue').textContent=d.calibrationDry;
   document.getElementById('wetCalValue').textContent=d.calibrationWet;
 
   const ws=document.getElementById('wifiSSID');
-  if(ws&&document.activeElement!==ws&&d.ssid) ws.value=d.ssid;
+  if(ws&&!ws.dataset.userEdited&&d.ssid&&!ws.value) ws.value=d.ssid;
   const sm=document.getElementById('sensorMin');
-  if(document.activeElement!==sm) sm.value=d.sensorMin;
+  if(sm&&!sm.dataset.userEdited) sm.value=d.sensorMin;
   const sx=document.getElementById('sensorMax');
-  if(document.activeElement!==sx) sx.value=d.sensorMax;
+  if(sx&&!sx.dataset.userEdited) sx.value=d.sensorMax;
 }
 
 function formatUptime(s){
@@ -360,21 +382,21 @@ async function setRelay(state){
     const d=await api('/api/relay',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({state})});
     if(d.success){showToast('Relay '+(state?'ON':'OFF'));refreshData();}
     else showToast('Failed',true);
-  }catch(e){showToast('Connection error',true);}
+  }catch(e){showToast(e.message||'Connection error',true);}
 }
 
 async function toggleRelay(){
   try{
     const d=await api('/api/relay/toggle',{method:'POST'});
     if(d.success){showToast('Relay toggled');refreshData();}
-  }catch(e){showToast('Connection error',true);}
+  }catch(e){showToast(e.message||'Connection error',true);}
 }
 
 async function setAutoMode(enabled){
   try{
     const d=await api('/api/auto',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});
     if(d.success){showToast('Auto '+(enabled?'enabled':'disabled'));refreshData();}
-  }catch(e){showToast('Connection error',true);}
+  }catch(e){showToast(e.message||'Connection error',true);}
 }
 
 async function saveThreshold(){
@@ -382,7 +404,7 @@ async function saveThreshold(){
   try{
     const d=await api('/api/threshold',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({threshold})});
     if(d.success){showToast('Threshold saved: '+threshold+'%');refreshData();}
-  }catch(e){showToast('Connection error',true);}
+  }catch(e){showToast(e.message||'Connection error',true);}
 }
 
 async function saveWiFi(){
@@ -391,11 +413,12 @@ async function saveWiFi(){
   if(!ssid){showToast('Please enter WiFi SSID',true);return;}
   if(ssid.length>32){showToast('SSID too long (max 32)',true);return;}
   if(password.length>63){showToast('Password too long (max 63)',true);return;}
+  if(!confirm('Save WiFi and reboot device?'))return;
   try{
     const d=await api('/api/wifi',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid,password})});
     if(d.success){showToast('Saved. Device will reboot...');}
     else showToast('Save failed',true);
-  }catch(e){showToast('Connection error',true);}
+  }catch(e){showToast(e.message||'Connection error',true);}
 }
 
 async function resetWiFi(){
@@ -403,14 +426,15 @@ async function resetWiFi(){
   try{
     const d=await api('/api/wifi/reset',{method:'POST'});
     if(d.success)showToast('Rebooting to AP mode...');
-  }catch(e){showToast('Connection error',true);}
+  }catch(e){showToast(e.message||'Connection error',true);}
 }
 
 async function saveCalibration(type){
   try{
     const d=await api('/api/calibrate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type})});
     if(d.success){showToast(type==='dry'?'Dry calibration saved':'Wet calibration saved');refreshData();}
-  }catch(e){showToast('Connection error',true);}
+    else showToast('Calibration rejected',true);
+  }catch(e){showToast(e.message||'Connection error',true);}
 }
 
 async function saveAdvancedCalibration(){
@@ -420,10 +444,24 @@ async function saveAdvancedCalibration(){
   try{
     const d=await api('/api/calibrate/advanced',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({min,max})});
     if(d.success){showToast('Advanced calibration saved');refreshData();}
-  }catch(e){showToast('Connection error',true);}
+  }catch(e){showToast(e.message||'Connection error',true);}
 }
 
 document.addEventListener('DOMContentLoaded',()=>{
+  ['wifiSSID','sensorMin','sensorMax','thresholdSlider'].forEach(id=>{
+    const el=document.getElementById(id);
+    if(!el)return;
+    el.addEventListener('input',()=>{el.dataset.userEdited='1';});
+    el.addEventListener('focus',()=>{
+      const t=el._editTimer;
+      if(t){clearTimeout(t);el._editTimer=null;}
+    });
+    el.addEventListener('blur',()=>{
+      const t=el._editTimer;
+      if(t)clearTimeout(t);
+      el._editTimer=setTimeout(()=>{delete el.dataset.userEdited;el._editTimer=null;},1500);
+    });
+  });
   refreshData();
   refreshInterval=setInterval(refreshData,3000);
 });
@@ -473,7 +511,7 @@ void markEepromDirty() {
 }
 
 void serviceEeprom() {
-  if (eepromDirty && millis() >= eepromDirtyAt) {
+  if (eepromDirty && (long)(millis() - eepromDirtyAt) >= 0) {
     eepromDirty = false;
     EEPROM.commit();
   }
@@ -862,6 +900,7 @@ void handleWiFiReset() {
 
 void handleCalibrate() {
   if (!server.hasArg("plain")) { sendErr("No body"); return; }
+  if (sensorFault) { sendErr("Sensor fault"); return; }
   String type;
   if (!jsonGetString(server.arg("plain"), "type", type)) { sendErr("No type"); return; }
 
@@ -874,8 +913,12 @@ void handleCalibrate() {
     return;
   }
   normalizeCalibration();
+  sensorMin = calibrationDry;
+  sensorMax = calibrationWet;
   saveIntToEEPROM(ADDR_CALIBRATION_DRY, calibrationDry);
   saveIntToEEPROM(ADDR_CALIBRATION_WET, calibrationWet);
+  saveIntToEEPROM(ADDR_SENSOR_MIN,      sensorMin);
+  saveIntToEEPROM(ADDR_SENSOR_MAX,      sensorMax);
   markEepromDirty();
   sendOK();
 }
@@ -887,11 +930,11 @@ void handleAdvancedCalibration() {
   if (!jsonGetInt(server.arg("plain"), "max", mx)) { sendErr("No max"); return; }
   if (mn < 0 || mn > 4095 || mx < 0 || mx > 4095 || mn == mx) { sendErr("Invalid range"); return; }
 
-  sensorMin = mn;
-  sensorMax = mx;
   calibrationDry = mn;
   calibrationWet = mx;
   normalizeCalibration();
+  sensorMin = calibrationDry;
+  sensorMax = calibrationWet;
 
   saveIntToEEPROM(ADDR_SENSOR_MIN,      sensorMin);
   saveIntToEEPROM(ADDR_SENSOR_MAX,      sensorMax);
@@ -923,9 +966,9 @@ void setup() {
 
   relayWrite(relayState);
 
-  for (int i = 0; i < SMOOTHING_SAMPLES; i++) moistureReadings[i] = 50;
-
-  updateSensorReadings();
+  rawMoistureValue = readMoistureRaw();
+  moisturePercent  = calculateMoisturePercent(rawMoistureValue);
+  for (int i = 0; i < SMOOTHING_SAMPLES; i++) moistureReadings[i] = moisturePercent;
   smoothedMoisture = moisturePercent;
 
   beginWifiConnect();
@@ -966,7 +1009,7 @@ void loop() {
     }
   }
 
-  if (pendingRestart && now >= pendingRestartAt) {
+  if (pendingRestart && (long)(now - pendingRestartAt) >= 0) {
     if (eepromDirty) EEPROM.commit();
     delay(100);
     ESP.restart();
