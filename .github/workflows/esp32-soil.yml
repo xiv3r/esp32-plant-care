@@ -31,10 +31,8 @@ jobs:
         arduino-cli core install esp32:esp32
         
         # Install libraries
-        arduino-cli lib install "ArduinoJson"
-        arduino-cli lib install "ESPAsyncWebServer"
-        arduino-cli lib install "AsyncTCP"
 
+        
         # Compile firmware
         cd ESP32-SOIL
         mv *.ino ESP32-SOIL.ino
