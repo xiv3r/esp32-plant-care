@@ -1,8 +1,10 @@
-/*******************************************************
+/*
+******************************************************
  * ESP32 Plant Monitor
  * Sensors: Capacitive Soil v2.0 + SHT31 + BH1750
  * Features: Web dashboard, settings, calibration, NVS persistence, captive portal
- *******************************************************/
+******************************************************
+ */
 
 #include <WiFi.h>
 #include <WebServer.h>
