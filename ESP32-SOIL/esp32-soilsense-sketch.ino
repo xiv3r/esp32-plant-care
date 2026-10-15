@@ -5,7 +5,7 @@
  *   - Soil Moisture Sensor: GPIO34 (ADC1_CH6, input-only)
  *   - Relay Module:         GPIO25 (Digital Output)
  *   - Factory Reset Button: GPIO0  (boot button, hold 5s)
- *   - Captive Portal
+ *
  * Libraries: WiFi, WebServer, EEPROM, WiFiUdp, DNSServer (all built-in)
  */
 
@@ -14,11 +14,13 @@
 #include <EEPROM.h>
 #include <WiFiUdp.h>
 #include <DNSServer.h>
+#include <string.h>
+#include <ctype.h>
 
 // ==================== PIN CONFIGURATION ====================
 #define SOIL_MOISTURE_PIN   34
 #define RELAY_PIN           25
-#define RELAY_ACTIVE_LOW    true
+#define RELAY_ACTIVE_LOW    1
 
 // ==================== FACTORY RESET BUTTON ====================
 #define FACTORY_RESET_PIN        0
@@ -40,7 +42,12 @@
 const char* WIFI_SSID     = "YOUR_WIFI_SSID";
 const char* WIFI_PASS     = "YOUR_WIFI_PASSWORD";
 const char* AP_SSID       = "ESP32_Soil_Monitor";
-const char* AP_PASS       = "12345678";
+const char* AP_PASS       = "password123";
+
+// ==================== RELAY AUTO-CONTROL LIMITS ====================
+#define RELAY_HYSTERESIS_PCT   5
+#define RELAY_MAX_ON_MS        300000UL
+#define RELAY_COOLDOWN_MS      60000UL
 
 // ==================== SETTINGS STRUCT ====================
 struct Settings {
@@ -50,6 +57,7 @@ struct Settings {
   uint8_t  threshold;
   uint8_t  autoMode;
   uint8_t  relayState;
+  uint8_t  _reserved;
   uint16_t readInterval;
   uint16_t crc;
 };
@@ -80,6 +88,8 @@ enum WifiApplyState : uint8_t {
 
 volatile WifiApplyState wifiApplyState = WIFI_IDLE;
 unsigned long          wifiApplyStart = 0;
+WifiConfig             wifiCfgPrev;
+bool                   wifiRollbackPending = false;
 
 enum ScanState : uint8_t {
   SCAN_IDLE = 0,
@@ -87,6 +97,7 @@ enum ScanState : uint8_t {
 };
 
 volatile ScanState scanState = SCAN_IDLE;
+unsigned long      scanStartMs = 0;
 
 // ==================== GLOBALS ====================
 WebServer server(80);
@@ -120,9 +131,9 @@ void snapshot(int &rawOut, int &pctOut, bool &relayOut, uint8_t &autoOut, uint8_
 uint16_t calcWifiCRC(const WifiConfig& c);
 void loadWifiConfig();
 void saveWifiConfig();
-void requestWifiApply();
 void serviceWifiApply();
 String wifiStatusJSON();
+String jsonEscape(const char* s);
 void handleWifiPage();
 void handleWifiStatus();
 void handleWifiScanStart();
@@ -296,6 +307,9 @@ let lastFetchOK  = Date.now();
 let failCount    = 0;
 let getInflight  = null;
 let postInflight = false;
+let mutating     = false;
+
+const userEdited = { dryValue:false, wetValue:false, threshold:false, readInterval:false };
 
 const $ = id => document.getElementById(id);
 const elMoisture  = $('moistureValue');
@@ -334,11 +348,16 @@ function showToast(msg, type) {
 
 function setBusy(el, busy) { if (el) el.disabled = !!busy; }
 
-async function doGet(url) {
-  if (getInflight) { try { getInflight.abort(); } catch(e){} }
+async function doGet(url, isPoll) {
+  if (isPoll && getInflight) { try { getInflight.abort(); } catch(e){} }
   const ctrl = new AbortController();
-  getInflight = ctrl;
-  const to = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT);
+  if (isPoll) getInflight = ctrl;
+  if (!isPoll) {
+    mutating = true;
+    if (getInflight) { try { getInflight.abort(); } catch(e){} getInflight = null; }
+  }
+  let timedOut = false;
+  const to = setTimeout(() => { timedOut = true; ctrl.abort(); }, FETCH_TIMEOUT);
   try {
     const res = await fetch(url, { signal: ctrl.signal, cache:'no-store' });
     clearTimeout(to);
@@ -351,15 +370,25 @@ async function doGet(url) {
     if (!text) throw new Error('Empty response');
     try { return JSON.parse(text); }
     catch(e) { throw new Error('Bad JSON'); }
+  } catch (err) {
+    if (err && err.name === 'AbortError' && timedOut) {
+      const e = new Error('Request timed out');
+      e.name = 'TimeoutError';
+      throw e;
+    }
+    throw err;
   } finally {
     clearTimeout(to);
-    if (getInflight === ctrl) getInflight = null;
+    if (isPoll && getInflight === ctrl) getInflight = null;
+    if (!isPoll) mutating = false;
   }
 }
 
 async function doPost(url, body) {
   if (postInflight) throw new Error('Another save in progress');
   postInflight = true;
+  mutating = true;
+  if (getInflight) { try { getInflight.abort(); } catch(e){} getInflight = null; }
   const ctrl = new AbortController();
   const to = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT);
   try {
@@ -382,6 +411,7 @@ async function doPost(url, body) {
   } finally {
     clearTimeout(to);
     postInflight = false;
+    mutating = false;
   }
 }
 
@@ -410,9 +440,14 @@ function updateUI(d) {
   elModeBadge.textContent = auto ? 'AUTO' : 'MANUAL';
   elModeBadge.className   = 'status-badge ' + (auto ? 'badge-auto' : 'badge-manual');
 
-  const pairs = [[elDry, d.dryValue],[elWet, d.wetValue],
-                 [elThr, d.threshold],[elInt, d.readInterval]];
-  for (const [el, val] of pairs) {
+  const pairs = [
+    [elDry, d.dryValue,     'dryValue'],
+    [elWet, d.wetValue,     'wetValue'],
+    [elThr, d.threshold,    'threshold'],
+    [elInt, d.readInterval, 'readInterval']
+  ];
+  for (const [el, val, key] of pairs) {
+    if (userEdited[key]) continue;
     if (document.activeElement !== el && Number.isFinite(Number(val))) {
       if (el.value !== String(val)) el.value = val;
     }
@@ -427,14 +462,15 @@ function updateUI(d) {
 }
 
 async function fetchStatus(silent) {
+  if (mutating) return;
   try {
-    const d = await doGet('/status');
+    const d = await doGet('/status', true);
     if (d) updateUI(d);
     failCount = 0;
     lastFetchOK = Date.now();
     elOffline.classList.remove('show');
   } catch (err) {
-    if (err.name === 'AbortError') return;
+    if (err && err.name === 'AbortError') return;
     failCount++;
     if (!silent) console.warn('Status:', err.message);
     if (Date.now() - lastFetchOK > OFFLINE_MS) {
@@ -451,7 +487,7 @@ function scheduleNextPoll() {
     : base;
 
   pollTimer = setTimeout(async () => {
-    if (!document.hidden) await fetchStatus(true);
+    if (!document.hidden && !mutating) await fetchStatus(true);
     scheduleNextPoll();
   }, delay);
 }
@@ -464,9 +500,10 @@ document.addEventListener('visibilitychange', () => {
 });
 
 async function setRelay(state) {
-  if (state === 1) {
-    if (!confirm('Turn relay ON manually?\n\nThis switches to MANUAL mode.')) return;
-  }
+  const msg = state === 1
+    ? 'Turn relay ON manually?\n\nThis switches to MANUAL mode.'
+    : 'Turn relay OFF manually?\n\nThis switches to MANUAL mode.';
+  if (!confirm(msg)) return;
   setBusy(btnOn, true); setBusy(btnOff, true);
   try {
     const d = await doGet('/relay?state=' + state);
@@ -524,6 +561,8 @@ async function saveSettings() {
       dryValue: dv, wetValue: wv, threshold: th, readInterval: ri
     });
     if (d) updateUI(d);
+    userEdited.dryValue = userEdited.wetValue =
+      userEdited.threshold = userEdited.readInterval = false;
     showToast('Settings saved ✓', 'success');
   } catch (err) {
     showToast('Save failed: ' + err.message, 'error');
@@ -536,9 +575,20 @@ btnOn.addEventListener('click',      () => setRelay(1));
 btnOff.addEventListener('click',     () => setRelay(0));
 btnAuto.addEventListener('click',    toggleAuto);
 btnSave.addEventListener('click',    saveSettings);
-btnRefresh.addEventListener('click', () => { failCount = 0; fetchStatus(false); });
+btnRefresh.addEventListener('click', () => {
+  userEdited.dryValue = userEdited.wetValue =
+    userEdited.threshold = userEdited.readInterval = false;
+  failCount = 0;
+  fetchStatus(false);
+});
 
-[elDry, elWet, elThr, elInt].forEach(el => {
+[
+  [elDry, 'dryValue'],
+  [elWet, 'wetValue'],
+  [elThr, 'threshold'],
+  [elInt, 'readInterval']
+].forEach(([el, key]) => {
+  el.addEventListener('input', () => { userEdited[key] = true; });
   el.addEventListener('keydown', e => {
     if (e.key === 'Enter') { e.preventDefault(); saveSettings(); }
   });
@@ -766,6 +816,12 @@ const btnReset   = $('btnReset');
 const btnBack    = $('btnBack');
 const netList    = $('netList');
 
+let userEditingSta = false;
+let userEditingAp  = false;
+
+inpStaSSID.addEventListener('input', () => { userEditingSta = true; });
+inpApSSID .addEventListener('input', () => { userEditingAp  = true; });
+
 let toastTimer = null;
 function showToast(msg, type) {
   elToast.textContent = msg;
@@ -780,7 +836,8 @@ function setBusy(el, busy) { if (el) el.disabled = !!busy; }
 
 async function apiFetch(url, opts) {
   const ctrl = new AbortController();
-  const to = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT);
+  let timedOut = false;
+  const to = setTimeout(() => { timedOut = true; ctrl.abort(); }, FETCH_TIMEOUT);
   try {
     const res = await fetch(url, Object.assign({}, opts, {
       signal: ctrl.signal,
@@ -795,6 +852,11 @@ async function apiFetch(url, opts) {
       throw new Error(msg);
     }
     return data;
+  } catch (err) {
+    if (err && err.name === 'AbortError' && timedOut) {
+      throw new Error('Request timed out');
+    }
+    throw err;
   } finally {
     clearTimeout(to);
   }
@@ -816,8 +878,12 @@ function updateStatus(d) {
   elStaSSID.textContent = d.staSSID || '--';
   elApSSID.textContent  = d.apSSID || '--';
 
-  if (document.activeElement !== inpStaSSID) inpStaSSID.value = d.staSSID || '';
-  if (document.activeElement !== inpApSSID)  inpApSSID.value  = d.apSSID  || '';
+  if (!userEditingSta && document.activeElement !== inpStaSSID) {
+    inpStaSSID.value = d.staSSID || '';
+  }
+  if (!userEditingAp && document.activeElement !== inpApSSID) {
+    inpApSSID.value = d.apSSID || '';
+  }
   inpApEnab.checked  = d.apEnabled === 1;
   inpForceAP.checked = d.forceAP === 1;
 }
@@ -828,6 +894,14 @@ async function refreshStatus() {
     updateStatus(d);
   } catch (err) {
     showToast('Status error: ' + err.message, 'error');
+  }
+}
+
+async function refreshStatusQuiet() {
+  try {
+    const d = await apiFetch('/wifi/status');
+    updateStatus(d);
+  } catch (err) {
   }
 }
 
@@ -878,6 +952,7 @@ async function scanNetworks() {
         inpStaPass.value = '';
         inpClearSta.checked = (n.enc === 0);
         inpStaPass.focus();
+        userEditingSta = true;
         document.querySelectorAll('.net-item').forEach(x => x.classList.remove('active'));
         div.classList.add('active');
         showToast('Selected: ' + ssid);
@@ -932,7 +1007,9 @@ async function saveWifi() {
     inpStaPass.value = '';
     inpApPass.value  = '';
     inpClearSta.checked = false;
-    setTimeout(refreshStatus, 3000);
+    userEditingSta = false;
+    userEditingAp  = false;
+    setTimeout(() => { if (!document.hidden) refreshStatusQuiet(); }, 3000);
   } catch (err) {
     showToast('Save failed: ' + err.message, 'error');
   } finally {
@@ -947,7 +1024,7 @@ async function resetWifi() {
     const d = await apiFetch('/wifi/reset');
     showToast('Reset ✓ Reconnecting…', 'success');
     if (d) updateStatus(d);
-    setTimeout(refreshStatus, 3000);
+    setTimeout(() => { if (!document.hidden) refreshStatusQuiet(); }, 3000);
   } catch (err) {
     showToast('Reset failed: ' + err.message, 'error');
   } finally {
@@ -955,7 +1032,11 @@ async function resetWifi() {
   }
 }
 
-btnRefresh.addEventListener('click', refreshStatus);
+btnRefresh.addEventListener('click', () => {
+  userEditingSta = false;
+  userEditingAp  = false;
+  refreshStatus();
+});
 btnScan.addEventListener('click',    scanNetworks);
 btnSave.addEventListener('click',    saveWifi);
 btnReset.addEventListener('click',   resetWifi);
@@ -980,13 +1061,13 @@ void factoryReset() {
 
   memset(&settings, 0, sizeof(settings));
   EEPROM.put(SETTINGS_ADDR, settings);
-  EEPROM.commit();
+  if (!EEPROM.commit()) { delay(50); EEPROM.commit(); }
 
   memset(&wifiCfg, 0, sizeof(wifiCfg));
   EEPROM.put(WIFI_CFG_ADDR, wifiCfg);
-  EEPROM.commit();
+  if (!EEPROM.commit()) { delay(50); EEPROM.commit(); }
 
-  delay(100);
+  delay(200);
   ESP.restart();
 }
 
@@ -1063,16 +1144,14 @@ void setup() {
   analogSetAttenuation(ADC_11db);
 #elif defined(ADC_ATTENUATION_11_DB)
   analogSetAttenuation(ADC_ATTENUATION_11_DB);
+#else
+  #warning "No 11dB attenuation macro found; ADC range may be wrong"
 #endif
   pinMode(SOIL_MOISTURE_PIN, INPUT);
 
+  digitalWrite(RELAY_PIN, RELAY_ACTIVE_LOW ? HIGH : LOW);
   pinMode(RELAY_PIN, OUTPUT);
   pinMode(FACTORY_RESET_PIN, INPUT_PULLUP);
-#if RELAY_ACTIVE_LOW
-  digitalWrite(RELAY_PIN, HIGH);
-#else
-  digitalWrite(RELAY_PIN, LOW);
-#endif
   setRelayHardware(false);
 
   EEPROM.begin(EEPROM_SIZE);
@@ -1092,15 +1171,6 @@ void setup() {
     if (wifiCfg.apEnabled) {
       WiFi.softAP(wifiCfg.apSSID, wifiCfg.apPass);
     }
-    WiFi.begin(wifiCfg.staSSID, wifiCfg.staPass);
-
-    unsigned long start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
-      delay(300);
-      yield();
-    }
-
-    apModeActive = (WiFi.status() != WL_CONNECTED) && wifiCfg.apEnabled;
   }
 
   server.on("/",                  HTTP_GET,  handleRoot);
@@ -1125,8 +1195,21 @@ void setup() {
   server.on("/ncsi.txt",                  HTTP_GET, handleCaptiveProbe);
   server.onNotFound(handleNotFound);
   server.begin();
-
   captivePortalStart();
+
+  if (!wifiCfg.forceAP && wifiCfg.staSSID[0] != 0) {
+    WiFi.begin(wifiCfg.staSSID, wifiCfg.staPass);
+
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+      server.handleClient();
+      if (captivePortalActive) dnsServer.processNextRequest();
+      checkFactoryResetButton();
+      delay(20);
+      yield();
+    }
+    apModeActive = (WiFi.status() != WL_CONNECTED) && wifiCfg.apEnabled;
+  }
 
   readSensor();
   updateRelay();
@@ -1150,7 +1233,8 @@ void loop() {
     updateRelay();
   }
 
-  if (!apModeActive && !wifiCfg.forceAP && wifiApplyState == WIFI_IDLE &&
+  if (!wifiCfg.forceAP && wifiApplyState == WIFI_IDLE &&
+      wifiCfg.staSSID[0] != 0 &&
       (now - lastWiFiCheck >= 15000UL)) {
     lastWiFiCheck = now;
     if (WiFi.status() != WL_CONNECTED) {
@@ -1177,17 +1261,6 @@ void readSensor() {
   int raw = count ? (int)(sum / count) : 0;
 
   int pct = calculateMoisture(raw);
-
-  static int  lastPct    = -1;
-  static int  stableRuns = 0;
-
-  if (lastPct >= 0 && abs(pct - lastPct) > 40) {
-    stableRuns++;
-    if (stableRuns < 3) return;
-  } else {
-    stableRuns = 0;
-  }
-  lastPct = pct;
 
   portENTER_CRITICAL(&g_mux);
   g_rawMoisture     = raw;
@@ -1220,31 +1293,67 @@ void setRelayHardware(bool on) {
 }
 
 void updateRelay() {
-  static unsigned long relayOnSince = 0;
-  static bool          maxTrip      = false;
+  static bool          pumpOn        = false;
+  static unsigned long relayOnSince  = 0;
+  static unsigned long cooldownUntil = 0;
+  static bool          wasAuto       = false;
 
   bool newState;
+  bool isAuto = (settings.autoMode == 1);
+  unsigned long now = millis();
 
-  if (settings.autoMode == 1) {
+  if (isAuto) {
     int pct = g_moisturePercent;
-    newState = (pct < settings.threshold);
 
-    if (newState && !g_relayActive) {
-      relayOnSince = millis();
-      maxTrip = false;
+    if (!wasAuto) {
+      if (pct < settings.threshold) {
+        pumpOn        = true;
+        relayOnSince  = now;
+        cooldownUntil = 0;
+      } else {
+        pumpOn = false;
+      }
     }
-    if (newState && (millis() - relayOnSince > 300000UL)) {
-      newState = false;
-      maxTrip = true;
+
+    int upperOff = (int)settings.threshold + RELAY_HYSTERESIS_PCT;
+    bool clamped = (upperOff >= 100);
+    if (clamped) upperOff = 100;
+
+    bool offCondition = clamped ? (pct >= upperOff) : (pct > upperOff);
+
+    if (!pumpOn && pct < settings.threshold) {
+      pumpOn       = true;
+      relayOnSince = now;
+    } else if (pumpOn && offCondition) {
+      pumpOn = false;
     }
+
+    if (pumpOn && (now - relayOnSince > RELAY_MAX_ON_MS)) {
+      pumpOn        = false;
+      cooldownUntil = now + RELAY_COOLDOWN_MS;
+    }
+
+    if (cooldownUntil && now < cooldownUntil) {
+      pumpOn = false;
+    } else if (cooldownUntil && now >= cooldownUntil) {
+      cooldownUntil = 0;
+    }
+
+    newState = pumpOn;
   } else {
-    newState = (settings.relayState == 1);
-    maxTrip = false;
+    newState      = (settings.relayState == 1);
+    pumpOn        = newState;
+    cooldownUntil = 0;
+    if (newState && relayOnSince == 0) relayOnSince = now;
   }
+
+  wasAuto = isAuto;
 
   if (newState != g_relayActive) {
     setRelayHardware(newState);
+    portENTER_CRITICAL(&g_mux);
     g_relayActive = newState;
+    portEXIT_CRITICAL(&g_mux);
   }
 }
 
@@ -1280,6 +1389,7 @@ void loadSettings() {
     settings.threshold    = 30;
     settings.autoMode     = 1;
     settings.relayState   = 0;
+    settings._reserved    = 0;
     settings.readInterval = 5;
     settings.crc          = calcCRC(settings);
     saveSettings();
@@ -1290,7 +1400,10 @@ void saveSettings() {
   settings.magic = SETTINGS_MAGIC;
   settings.crc   = calcCRC(settings);
   EEPROM.put(SETTINGS_ADDR, settings);
-  EEPROM.commit();
+  if (!EEPROM.commit()) {
+    delay(20);
+    EEPROM.commit();
+  }
 }
 
 // ==================== WIFI CONFIG ====================
@@ -1338,11 +1451,10 @@ void saveWifiConfig() {
   wifiCfg.magic = WIFI_CFG_MAGIC;
   wifiCfg.crc   = calcWifiCRC(wifiCfg);
   EEPROM.put(WIFI_CFG_ADDR, wifiCfg);
-  EEPROM.commit();
-}
-
-void requestWifiApply() {
-  wifiApplyState = WIFI_APPLY_PENDING;
+  if (!EEPROM.commit()) {
+    delay(20);
+    EEPROM.commit();
+  }
 }
 
 void serviceWifiApply() {
@@ -1353,6 +1465,10 @@ void serviceWifiApply() {
       return;
 
     case WIFI_APPLY_PENDING:
+      if (wifiApplyStart != 0 && (millis() - wifiApplyStart) < 500UL) {
+        return;
+      }
+      wifiApplyStart = 0;
       captivePortalStop();
       WiFi.disconnect(true);
       WiFi.mode(wifiCfg.forceAP ? WIFI_AP :
@@ -1367,7 +1483,9 @@ void serviceWifiApply() {
         if (wifiCfg.apEnabled) {
           WiFi.softAP(wifiCfg.apSSID, wifiCfg.apPass);
         }
-        WiFi.begin(wifiCfg.staSSID, wifiCfg.staPass);
+        if (wifiCfg.staSSID[0] != 0) {
+          WiFi.begin(wifiCfg.staSSID, wifiCfg.staPass);
+        }
         captivePortalStart();
         wifiApplyStart = now;
         wifiApplyState = WIFI_APPLY_CONNECTING;
@@ -1377,9 +1495,43 @@ void serviceWifiApply() {
     case WIFI_APPLY_CONNECTING:
       if (WiFi.status() == WL_CONNECTED) {
         apModeActive = false;
+        wifiRollbackPending = false;
         wifiApplyState = WIFI_APPLY_DONE;
-      } else if (now - wifiApplyStart > 15000UL) {
-        apModeActive = wifiCfg.apEnabled;
+      } else if (now - wifiApplyStart > 20000UL) {
+        if (!wifiCfg.apEnabled && !wifiCfg.forceAP &&
+            wifiRollbackPending && wifiCfgPrev.magic == WIFI_CFG_MAGIC) {
+          memcpy(&wifiCfg, &wifiCfgPrev, sizeof(WifiConfig));
+          saveWifiConfig();
+          wifiRollbackPending = false;
+          WiFi.disconnect(true);
+          WiFi.mode(wifiCfg.forceAP ? WIFI_AP :
+                    (wifiCfg.apEnabled ? WIFI_AP_STA : WIFI_STA));
+          if (wifiCfg.forceAP) {
+            WiFi.softAP(wifiCfg.apSSID, wifiCfg.apPass);
+            apModeActive = true;
+            captivePortalStart();
+          } else {
+            if (wifiCfg.apEnabled) {
+              WiFi.softAP(wifiCfg.apSSID, wifiCfg.apPass);
+              captivePortalStart();
+            }
+            if (wifiCfg.staSSID[0] != 0) {
+              WiFi.begin(wifiCfg.staSSID, wifiCfg.staPass);
+            }
+            wifiApplyStart = now;
+            return;
+          }
+        } else {
+          if (!wifiCfg.apEnabled && !wifiCfg.forceAP) {
+            wifiCfg.apEnabled = 1;
+            saveWifiConfig();
+            WiFi.mode(WIFI_AP_STA);
+            WiFi.softAP(wifiCfg.apSSID, wifiCfg.apPass);
+            captivePortalStart();
+          }
+          apModeActive = wifiCfg.apEnabled;
+        }
+        wifiRollbackPending = false;
         wifiApplyState = WIFI_APPLY_DONE;
       }
       return;
@@ -1388,6 +1540,32 @@ void serviceWifiApply() {
       wifiApplyState = WIFI_IDLE;
       return;
   }
+}
+
+String jsonEscape(const char* s) {
+  String out;
+  out.reserve(strlen(s) + 8);
+  for (const char* p = s; *p; p++) {
+    char c = *p;
+    switch (c) {
+      case '"':  out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\b': out += "\\b";  break;
+      case '\f': out += "\\f";  break;
+      case '\n': out += "\\n";  break;
+      case '\r': out += "\\r";  break;
+      case '\t': out += "\\t";  break;
+      default:
+        if ((uint8_t)c < 0x20) {
+          char buf[7];
+          snprintf(buf, sizeof(buf), "\\u%04x", (unsigned)(uint8_t)c);
+          out += buf;
+        } else {
+          out += c;
+        }
+    }
+  }
+  return out;
 }
 
 String wifiStatusJSON() {
@@ -1399,8 +1577,8 @@ String wifiStatusJSON() {
     (m == WIFI_AP_STA) ? "AP+STA" : "OFF";
 
   j += "\"mode\":\"" + String(modeStr) + "\",";
-  j += "\"staSSID\":\"" + String(wifiCfg.staSSID) + "\",";
-  j += "\"apSSID\":\""  + String(wifiCfg.apSSID)  + "\",";
+  j += "\"staSSID\":\"" + jsonEscape(wifiCfg.staSSID) + "\",";
+  j += "\"apSSID\":\""  + jsonEscape(wifiCfg.apSSID)  + "\",";
   j += "\"apEnabled\":" + String(wifiCfg.apEnabled) + ",";
   j += "\"forceAP\":"   + String(wifiCfg.forceAP) + ",";
   j += "\"connected\":" + String(WiFi.status() == WL_CONNECTED ? 1 : 0) + ",";
@@ -1438,8 +1616,13 @@ void handleWifiStatus() {
 
 void handleWifiScanStart() {
   if (scanState == SCAN_RUNNING) {
-    server.send(200, "application/json", "{\"state\":\"running\"}");
-    return;
+    if (scanStartMs != 0 && (millis() - scanStartMs) < 60000UL) {
+      server.send(200, "application/json", "{\"state\":\"running\"}");
+      return;
+    }
+    WiFi.scanDelete();
+    scanState    = SCAN_IDLE;
+    scanStartMs  = 0;
   }
 
   WiFi.scanDelete();
@@ -1447,6 +1630,7 @@ void handleWifiScanStart() {
   wifi_mode_t m = WiFi.getMode();
   if (m == WIFI_AP) {
     WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP(wifiCfg.apSSID, wifiCfg.apPass);
   }
 
   int16_t r = WiFi.scanNetworks(true, false);
@@ -1455,11 +1639,28 @@ void handleWifiScanStart() {
     return;
   }
 
-  scanState = SCAN_RUNNING;
+  scanState   = SCAN_RUNNING;
+  scanStartMs = millis();
   server.send(200, "application/json", "{\"state\":\"running\"}");
 }
 
 void handleWifiScanResults() {
+  if (scanState == SCAN_RUNNING &&
+      scanStartMs != 0 &&
+      (millis() - scanStartMs > 45000UL)) {
+    WiFi.scanDelete();
+    scanState   = SCAN_IDLE;
+    scanStartMs = 0;
+    server.send(200, "application/json", "{\"state\":\"failed\"}");
+    server.client().flush();
+    delay(50);
+    if (wifiCfg.forceAP) {
+      WiFi.mode(WIFI_AP);
+      WiFi.softAP(wifiCfg.apSSID, wifiCfg.apPass);
+    }
+    return;
+  }
+
   int16_t n = WiFi.scanComplete();
 
   if (n == WIFI_SCAN_RUNNING) {
@@ -1467,28 +1668,51 @@ void handleWifiScanResults() {
     return;
   }
   if (n == WIFI_SCAN_FAILED) {
-    scanState = SCAN_IDLE;
+    WiFi.scanDelete();
+    scanState   = SCAN_IDLE;
+    scanStartMs = 0;
     server.send(200, "application/json", "{\"state\":\"failed\"}");
+    server.client().flush();
+    delay(50);
+    if (wifiCfg.forceAP) {
+      WiFi.mode(WIFI_AP);
+      WiFi.softAP(wifiCfg.apSSID, wifiCfg.apPass);
+    }
     return;
   }
   if (n < 0) {
+    scanState   = SCAN_IDLE;
+    scanStartMs = 0;
     server.send(200, "application/json", "{\"state\":\"idle\"}");
+    server.client().flush();
+    delay(50);
+    if (wifiCfg.forceAP) {
+      WiFi.mode(WIFI_AP);
+      WiFi.softAP(wifiCfg.apSSID, wifiCfg.apPass);
+    }
     return;
   }
 
   String j = "{\"state\":\"done\",\"networks\":[";
   for (int i = 0; i < n; i++) {
     if (i > 0) j += ",";
-    String ssid = WiFi.SSID(i);
-    ssid.replace("\"", "\\\"");
+    String ssid = jsonEscape(WiFi.SSID(i).c_str());
     j += "{\"ssid\":\"" + ssid + "\",";
     j += "\"rssi\":" + String(WiFi.RSSI(i)) + ",";
     j += "\"enc\":" + String(WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? 0 : 1) + "}";
   }
   j += "]}";
   WiFi.scanDelete();
-  scanState = SCAN_IDLE;
+  scanState   = SCAN_IDLE;
+  scanStartMs = 0;
   server.send(200, "application/json", j);
+  server.client().flush();
+  delay(50);
+
+  if (wifiCfg.forceAP) {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(wifiCfg.apSSID, wifiCfg.apPass);
+  }
 }
 
 void handleWifiSave() {
@@ -1504,9 +1728,25 @@ void handleWifiSave() {
     int i = body.indexOf(k);
     if (i < 0) return String(def);
     i += k.length();
-    int end = body.indexOf('"', i);
-    if (end < 0) return String(def);
-    return body.substring(i, end);
+    String out;
+    while (i < (int)body.length()) {
+      char c = body[i];
+      if (c == '\\' && i + 1 < (int)body.length()) {
+        char n = body[i + 1];
+        switch (n) {
+          case '"':  out += '"';  i += 2; continue;
+          case '\\': out += '\\'; i += 2; continue;
+          case 'n':  out += '\n'; i += 2; continue;
+          case 'r':  out += '\r'; i += 2; continue;
+          case 't':  out += '\t'; i += 2; continue;
+          default:   out += c;    i += 1; continue;
+        }
+      }
+      if (c == '"') break;
+      out += c;
+      i++;
+    }
+    return out;
   };
 
   auto extractInt = [&](const char* key, int def) -> int {
@@ -1523,6 +1763,11 @@ void handleWifiSave() {
     }
     return found ? (neg?-v:v) : def;
   };
+
+  if (wifiApplyState == WIFI_IDLE) {
+    memcpy(&wifiCfgPrev, &wifiCfg, sizeof(WifiConfig));
+  }
+  wifiRollbackPending = false;
 
   String newStaSSID = extractStr("staSSID", wifiCfg.staSSID);
   String newStaPass = extractStr("staPass", "");
@@ -1567,7 +1812,7 @@ void handleWifiSave() {
   wifiCfg.staSSID[sizeof(wifiCfg.staSSID) - 1] = 0;
 
   if (clearStaPw == "1") {
-    wifiCfg.staPass[0] = 0;
+    memset(wifiCfg.staPass, 0, sizeof(wifiCfg.staPass));
   } else if (newStaPass.length() > 0) {
     strncpy(wifiCfg.staPass, newStaPass.c_str(), sizeof(wifiCfg.staPass) - 1);
     wifiCfg.staPass[sizeof(wifiCfg.staPass) - 1] = 0;
@@ -1588,11 +1833,20 @@ void handleWifiSave() {
 
   String resp = wifiStatusJSON();
   server.send(200, "application/json", resp);
+  server.client().flush();
+  delay(120);
 
-  requestWifiApply();
+  wifiRollbackPending = true;
+  wifiApplyStart      = millis();
+  wifiApplyState      = WIFI_APPLY_PENDING;
 }
 
 void handleWifiReset() {
+  if (wifiApplyState == WIFI_IDLE) {
+    memcpy(&wifiCfgPrev, &wifiCfg, sizeof(WifiConfig));
+  }
+  wifiRollbackPending = false;
+
   memset(&wifiCfg, 0, sizeof(wifiCfg));
   wifiCfg.magic = WIFI_CFG_MAGIC;
   strncpy(wifiCfg.staSSID, WIFI_SSID, sizeof(wifiCfg.staSSID) - 1);
@@ -1605,8 +1859,12 @@ void handleWifiReset() {
 
   String resp = wifiStatusJSON();
   server.send(200, "application/json", resp);
+  server.client().flush();
+  delay(120);
 
-  requestWifiApply();
+  wifiRollbackPending = true;
+  wifiApplyStart      = millis();
+  wifiApplyState      = WIFI_APPLY_PENDING;
 }
 
 // ==================== SNAPSHOT ====================
@@ -1645,15 +1903,29 @@ void handleStatus() {
 
 void handleRelay() {
   if (server.hasArg("state")) {
-    int s = server.arg("state").toInt();
+    String sv = server.arg("state");
+    if (sv != "0" && sv != "1") {
+      server.send(400, "application/json",
+                  "{\"error\":\"state must be 0 or 1\"}");
+      return;
+    }
+    uint8_t newRelay = (sv == "1") ? 1 : 0;
+    bool changed = (settings.autoMode != 0) ||
+                   (settings.relayState != newRelay);
     settings.autoMode   = 0;
-    settings.relayState = (s == 1) ? 1 : 0;
-    saveSettings();
+    settings.relayState = newRelay;
+    if (changed) saveSettings();
 
     bool newState = (settings.relayState == 1);
-    if (newState != g_relayActive) {
+    bool curRelay;
+    portENTER_CRITICAL(&g_mux);
+    curRelay = g_relayActive;
+    portEXIT_CRITICAL(&g_mux);
+    if (newState != curRelay) {
       setRelayHardware(newState);
+      portENTER_CRITICAL(&g_mux);
       g_relayActive = newState;
+      portEXIT_CRITICAL(&g_mux);
     }
   }
   handleStatus();
@@ -1661,12 +1933,26 @@ void handleRelay() {
 
 void handleAuto() {
   if (server.hasArg("state")) {
-    int s = server.arg("state").toInt();
-    settings.autoMode = (s == 1) ? 1 : 0;
-    if (settings.autoMode == 0) {
-      settings.relayState = g_relayActive ? 1 : 0;
+    String sv = server.arg("state");
+    if (sv != "0" && sv != "1") {
+      server.send(400, "application/json",
+                  "{\"error\":\"state must be 0 or 1\"}");
+      return;
     }
-    saveSettings();
+    uint8_t newAuto = (sv == "1") ? 1 : 0;
+    bool changed = (settings.autoMode != newAuto);
+    settings.autoMode = newAuto;
+    if (settings.autoMode == 0) {
+      bool curRelay;
+      portENTER_CRITICAL(&g_mux);
+      curRelay = g_relayActive;
+      portEXIT_CRITICAL(&g_mux);
+      uint8_t newRelay = curRelay ? 1 : 0;
+      if (settings.relayState != newRelay) {
+        settings.relayState = newRelay;
+      }
+    }
+    if (changed) saveSettings();
     updateRelay();
   }
   handleStatus();
@@ -1723,6 +2009,7 @@ void handleSettings() {
   saveSettings();
 
   readSensor();
+  lastReadTime = millis();
   updateRelay();
   handleStatus();
 }
