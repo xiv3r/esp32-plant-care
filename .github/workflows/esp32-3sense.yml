@@ -5,7 +5,7 @@ on:
     branches:
       - main
     paths:
-      - 'ESP32-SOIL/*.ino'
+      - 'ESP32-3SENSE/*.ino'
       
 jobs:
   build-and-release:
