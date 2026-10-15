@@ -1,4 +1,4 @@
-name: Build ESP32 Soil Moisture Firmware
+name: Build ESP32 3 Sensor Firmware
 
 on:
   push:
