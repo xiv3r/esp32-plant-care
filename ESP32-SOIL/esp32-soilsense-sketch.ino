@@ -4,18 +4,28 @@
  * Hardware:
  *   - Soil Moisture Sensor: GPIO34 (ADC1_CH6, input-only)
  *   - Relay Module:         GPIO25 (Digital Output)
+ *   - Factory Reset Button: GPIO0  (boot button, hold 5s)
  *
- * Libraries: WiFi, WebServer, EEPROM (all built-in)
+ * Libraries: WiFi, WebServer, EEPROM, WiFiUdp, DNSServer (all built-in)
  */
 
 #include <WiFi.h>
 #include <WebServer.h>
 #include <EEPROM.h>
+#include <WiFiUdp.h>
+#include <DNSServer.h>
 
 // ==================== PIN CONFIGURATION ====================
 #define SOIL_MOISTURE_PIN   34
 #define RELAY_PIN           25
 #define RELAY_ACTIVE_LOW    true
+
+// ==================== FACTORY RESET BUTTON ====================
+#define FACTORY_RESET_PIN        0
+#define FACTORY_RESET_HOLD_MS    5000
+
+// ==================== CAPTIVE PORTAL ====================
+#define DNS_PORT                 53
 
 // ==================== EEPROM ====================
 #define EEPROM_SIZE         512
@@ -80,6 +90,8 @@ volatile ScanState scanState = SCAN_IDLE;
 
 // ==================== GLOBALS ====================
 WebServer server(80);
+DNSServer dnsServer;
+bool      captivePortalActive = false;
 
 volatile int  g_rawMoisture      = 0;
 volatile int  g_moisturePercent  = 0;
@@ -117,6 +129,12 @@ void handleWifiScanStart();
 void handleWifiScanResults();
 void handleWifiSave();
 void handleWifiReset();
+void checkFactoryResetButton();
+void factoryReset();
+void captivePortalStart();
+void captivePortalStop();
+bool isApClient();
+void handleCaptiveProbe();
 
 // ==================== INDEX HTML ====================
 const char INDEX_HTML[] PROGMEM = R"HTMLPAGE(
@@ -951,6 +969,91 @@ setInterval(refreshStatus, 5000);
 </html>
 )WIFIPAGE";
 
+// ==================== FACTORY RESET ====================
+void factoryReset() {
+  setRelayHardware(false);
+  g_relayActive = false;
+
+  captivePortalStop();
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+
+  memset(&settings, 0, sizeof(settings));
+  EEPROM.put(SETTINGS_ADDR, settings);
+  EEPROM.commit();
+
+  memset(&wifiCfg, 0, sizeof(wifiCfg));
+  EEPROM.put(WIFI_CFG_ADDR, wifiCfg);
+  EEPROM.commit();
+
+  delay(100);
+  ESP.restart();
+}
+
+void checkFactoryResetButton() {
+  static bool          pressed    = false;
+  static unsigned long pressStart = 0;
+  static bool          triggered  = false;
+
+  bool isDown = (digitalRead(FACTORY_RESET_PIN) == LOW);
+
+  if (isDown) {
+    if (!pressed) {
+      pressed    = true;
+      pressStart = millis();
+      triggered  = false;
+    } else if (!triggered &&
+               (millis() - pressStart >= FACTORY_RESET_HOLD_MS)) {
+      triggered = true;
+      pressed   = false;
+      factoryReset();
+    }
+  } else {
+    pressed   = false;
+    triggered = false;
+  }
+}
+
+// ==================== CAPTIVE PORTAL ====================
+void captivePortalStart() {
+  if (captivePortalActive) return;
+  if (!wifiCfg.apEnabled && !wifiCfg.forceAP) return;
+
+  dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
+  captivePortalActive = dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
+}
+
+void captivePortalStop() {
+  if (!captivePortalActive) return;
+  dnsServer.stop();
+  captivePortalActive = false;
+}
+
+bool isApClient() {
+  if (!wifiCfg.apEnabled && !wifiCfg.forceAP) return false;
+  wifi_mode_t m = WiFi.getMode();
+  if (m != WIFI_AP && m != WIFI_AP_STA) return false;
+
+  IPAddress apIP   = WiFi.softAPIP();
+  IPAddress mask   = WiFi.softAPSubnetMask();
+  IPAddress client = server.client().remoteIP();
+
+  for (int i = 0; i < 4; i++) {
+    if ((client[i] & mask[i]) != (apIP[i] & mask[i])) return false;
+  }
+  if (client == apIP) return false;
+  return true;
+}
+
+void handleCaptiveProbe() {
+  if (isApClient()) {
+    server.sendHeader("Location", "http://" + WiFi.softAPIP().toString() + "/", true);
+    server.send(302, "text/plain", "");
+  } else {
+    server.send(404, "text/plain", "404 Not Found");
+  }
+}
+
 // ==================== SETUP ====================
 void setup() {
   analogReadResolution(12);
@@ -964,6 +1067,7 @@ void setup() {
   pinMode(SOIL_MOISTURE_PIN, INPUT);
 
   pinMode(RELAY_PIN, OUTPUT);
+  pinMode(FACTORY_RESET_PIN, INPUT_PULLUP);
 #if RELAY_ACTIVE_LOW
   digitalWrite(RELAY_PIN, HIGH);
 #else
@@ -1010,8 +1114,19 @@ void setup() {
   server.on("/wifi/scan/results", HTTP_GET,  handleWifiScanResults);
   server.on("/wifi/save",         HTTP_POST, handleWifiSave);
   server.on("/wifi/reset",        HTTP_GET,  handleWifiReset);
+  server.on("/generate_204",              HTTP_GET, handleCaptiveProbe);
+  server.on("/gen_204",                   HTTP_GET, handleCaptiveProbe);
+  server.on("/hotspot-detect.html",       HTTP_GET, handleCaptiveProbe);
+  server.on("/library/test/success.html", HTTP_GET, handleCaptiveProbe);
+  server.on("/connecttest.txt",           HTTP_GET, handleCaptiveProbe);
+  server.on("/redirect",                  HTTP_GET, handleCaptiveProbe);
+  server.on("/canonical.html",            HTTP_GET, handleCaptiveProbe);
+  server.on("/success.txt",               HTTP_GET, handleCaptiveProbe);
+  server.on("/ncsi.txt",                  HTTP_GET, handleCaptiveProbe);
   server.onNotFound(handleNotFound);
   server.begin();
+
+  captivePortalStart();
 
   readSensor();
   updateRelay();
@@ -1021,7 +1136,9 @@ void setup() {
 // ==================== LOOP ====================
 void loop() {
   server.handleClient();
+  if (captivePortalActive) dnsServer.processNextRequest();
   serviceWifiApply();
+  checkFactoryResetButton();
 
   unsigned long now = millis();
 
@@ -1236,6 +1353,7 @@ void serviceWifiApply() {
       return;
 
     case WIFI_APPLY_PENDING:
+      captivePortalStop();
       WiFi.disconnect(true);
       WiFi.mode(wifiCfg.forceAP ? WIFI_AP :
                 (wifiCfg.apEnabled ? WIFI_AP_STA : WIFI_STA));
@@ -1243,12 +1361,14 @@ void serviceWifiApply() {
       if (wifiCfg.forceAP) {
         WiFi.softAP(wifiCfg.apSSID, wifiCfg.apPass);
         apModeActive = true;
+        captivePortalStart();
         wifiApplyState = WIFI_APPLY_DONE;
       } else {
         if (wifiCfg.apEnabled) {
           WiFi.softAP(wifiCfg.apSSID, wifiCfg.apPass);
         }
         WiFi.begin(wifiCfg.staSSID, wifiCfg.staPass);
+        captivePortalStart();
         wifiApplyStart = now;
         wifiApplyState = WIFI_APPLY_CONNECTING;
       }
@@ -1608,5 +1728,10 @@ void handleSettings() {
 }
 
 void handleNotFound() {
+  if (isApClient()) {
+    server.sendHeader("Location", "http://" + WiFi.softAPIP().toString() + "/", true);
+    server.send(302, "text/plain", "");
+    return;
+  }
   server.send(404, "text/plain", "404 Not Found");
 }
