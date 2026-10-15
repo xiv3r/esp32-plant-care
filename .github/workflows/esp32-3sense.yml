@@ -29,7 +29,12 @@ jobs:
         arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
         arduino-cli core update-index
         arduino-cli core install esp32:esp32
-        
+
+        arduino-cli lib install "Adafruit SHT31 Library"
+        arduino-cli lib install "BH1750"
+        arduino-cli lib install "ArduinoJson"
+        arduino-cli lib install "Adafruit BusIO"
+
         # Compile firmware
         cd ESP32-3SENSE
         mv *.ino ESP32-3SENSE.ino
