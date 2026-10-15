@@ -2,6 +2,7 @@
 
 Here's the **complete wiring** for the ESP32 Soil Moisture Monitoring + Relay Control + Web Dashboard system.
 
+<img src="https://github.com/xiv3r/esp32-plant-care/blob/main/ESP32-SOIL/esp32-soil-sensor.png">
 ---
 
 ## 📦 REQUIRED COMPONENTS
