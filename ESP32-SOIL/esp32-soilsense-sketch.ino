@@ -44,7 +44,7 @@
 const char* WIFI_SSID     = "YOUR_WIFI_SSID";
 const char* WIFI_PASS     = "YOUR_WIFI_PASSWORD";
 const char* AP_SSID       = "ESP32_Soil_Monitor";
-const char* AP_PASS       = "password123";
+const char* AP_PASS       = "12345678";
 
 // ==================== RELAY AUTO-CONTROL LIMITS ====================
 #define RELAY_HYSTERESIS_PCT   5
