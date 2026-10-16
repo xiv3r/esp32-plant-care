@@ -1,6 +1,8 @@
 /*
  * ESP32 Soil Moisture Monitoring + Relay Control + Web Dashboard
  * ================================================================
+ * Author: Raff Alds
+ * Github: github.com/xiv3r
  * Hardware:
  *   - Soil Moisture Sensor: GPIO34 (ADC1_CH6, input-only)
  *   - Relay Module:         GPIO25 (Digital Output)
@@ -1072,19 +1074,31 @@ void factoryReset() {
 }
 
 void checkFactoryResetButton() {
-  static bool          pressed    = false;
-  static unsigned long pressStart = 0;
-  static bool          triggered  = false;
+  static bool          pressed     = false;
+  static bool          lastReading = false;
+  static unsigned long lastChange  = 0;
+  static unsigned long pressStart  = 0;
+  static bool          triggered   = false;
+  static bool          stable      = false;
 
-  bool isDown = (digitalRead(FACTORY_RESET_PIN) == LOW);
+  bool raw = (digitalRead(FACTORY_RESET_PIN) == LOW);
+  unsigned long now = millis();
 
-  if (isDown) {
+  if (raw != lastReading) {
+    lastChange  = now;
+    lastReading = raw;
+  }
+  if ((now - lastChange) >= 50UL) {
+    stable = raw;
+  }
+
+  if (stable) {
     if (!pressed) {
       pressed    = true;
-      pressStart = millis();
+      pressStart = now;
       triggered  = false;
     } else if (!triggered &&
-               (millis() - pressStart >= FACTORY_RESET_HOLD_MS)) {
+               (now - pressStart >= FACTORY_RESET_HOLD_MS)) {
       triggered = true;
       pressed   = false;
       factoryReset();
@@ -1154,9 +1168,31 @@ void setup() {
   pinMode(FACTORY_RESET_PIN, INPUT_PULLUP);
   setRelayHardware(false);
 
-  EEPROM.begin(EEPROM_SIZE);
-  loadSettings();
-  loadWifiConfig();
+  if (!EEPROM.begin(EEPROM_SIZE)) {
+    memset(&settings, 0, sizeof(settings));
+    settings.magic        = SETTINGS_MAGIC;
+    settings.dryValue     = 3200;
+    settings.wetValue     = 1400;
+    settings.threshold    = 30;
+    settings.autoMode     = 1;
+    settings.relayState   = 0;
+    settings._reserved    = 0;
+    settings.readInterval = 5;
+    settings.crc          = calcCRC(settings);
+
+    memset(&wifiCfg, 0, sizeof(wifiCfg));
+    wifiCfg.magic = WIFI_CFG_MAGIC;
+    strncpy(wifiCfg.staSSID, WIFI_SSID, sizeof(wifiCfg.staSSID) - 1);
+    strncpy(wifiCfg.staPass, WIFI_PASS, sizeof(wifiCfg.staPass) - 1);
+    strncpy(wifiCfg.apSSID,  AP_SSID,   sizeof(wifiCfg.apSSID) - 1);
+    strncpy(wifiCfg.apPass,  AP_PASS,   sizeof(wifiCfg.apPass) - 1);
+    wifiCfg.apEnabled = 1;
+    wifiCfg.forceAP   = 0;
+    wifiCfg.crc       = calcWifiCRC(wifiCfg);
+  } else {
+    loadSettings();
+    loadWifiConfig();
+  }
 
   WiFi.persistent(false);
   WiFi.setSleep(false);
@@ -1208,7 +1244,16 @@ void setup() {
       delay(20);
       yield();
     }
-    apModeActive = (WiFi.status() != WL_CONNECTED) && wifiCfg.apEnabled;
+
+    if (WiFi.status() != WL_CONNECTED &&
+        !wifiCfg.apEnabled && !wifiCfg.forceAP) {
+      WiFi.mode(WIFI_AP_STA);
+      WiFi.softAP(wifiCfg.apSSID, wifiCfg.apPass);
+      captivePortalStart();
+      apModeActive = true;
+    } else {
+      apModeActive = (WiFi.status() != WL_CONNECTED) && wifiCfg.apEnabled;
+    }
   }
 
   readSensor();
@@ -1238,7 +1283,6 @@ void loop() {
       (now - lastWiFiCheck >= 15000UL)) {
     lastWiFiCheck = now;
     if (WiFi.status() != WL_CONNECTED) {
-      WiFi.disconnect();
       WiFi.begin(wifiCfg.staSSID, wifiCfg.staPass);
     }
   }
@@ -1293,10 +1337,11 @@ void setRelayHardware(bool on) {
 }
 
 void updateRelay() {
-  static bool          pumpOn        = false;
-  static unsigned long relayOnSince  = 0;
-  static unsigned long cooldownUntil = 0;
-  static bool          wasAuto       = false;
+  static bool          pumpOn         = false;
+  static unsigned long relayOnSince   = 0;
+  static unsigned long cooldownStart  = 0;
+  static bool          cooldownActive = false;
+  static bool          wasAuto        = false;
 
   bool newState;
   bool isAuto = (settings.autoMode == 1);
@@ -1307,9 +1352,9 @@ void updateRelay() {
 
     if (!wasAuto) {
       if (pct < settings.threshold) {
-        pumpOn        = true;
-        relayOnSince  = now;
-        cooldownUntil = 0;
+        pumpOn         = true;
+        relayOnSince   = now;
+        cooldownActive = false;
       } else {
         pumpOn = false;
       }
@@ -1329,21 +1374,24 @@ void updateRelay() {
     }
 
     if (pumpOn && (now - relayOnSince > RELAY_MAX_ON_MS)) {
-      pumpOn        = false;
-      cooldownUntil = now + RELAY_COOLDOWN_MS;
+      pumpOn         = false;
+      cooldownActive = true;
+      cooldownStart  = now;
     }
 
-    if (cooldownUntil && now < cooldownUntil) {
-      pumpOn = false;
-    } else if (cooldownUntil && now >= cooldownUntil) {
-      cooldownUntil = 0;
+    if (cooldownActive) {
+      if ((now - cooldownStart) >= RELAY_COOLDOWN_MS) {
+        cooldownActive = false;
+      } else {
+        pumpOn = false;
+      }
     }
 
     newState = pumpOn;
   } else {
-    newState      = (settings.relayState == 1);
-    pumpOn        = newState;
-    cooldownUntil = 0;
+    newState       = (settings.relayState == 1);
+    pumpOn         = newState;
+    cooldownActive = false;
     if (newState && relayOnSince == 0) relayOnSince = now;
   }
 
@@ -1425,13 +1473,15 @@ void loadWifiConfig() {
             && (wifiCfg.crc == calcWifiCRC(wifiCfg))
             && (wifiCfg.apEnabled <= 1)
             && (wifiCfg.forceAP <= 1)
-            && (strlen(wifiCfg.apSSID) >= 1)
-            && (strlen(wifiCfg.apSSID) <= 32)
-            && (strlen(wifiCfg.apPass) >= 8)
-            && (strlen(wifiCfg.apPass) <= 64)
-            && (strlen(wifiCfg.staSSID) <= 32)
-            && (strlen(wifiCfg.staPass) <= 64)
-            && (strlen(wifiCfg.staSSID) >= 1 || wifiCfg.apEnabled == 1);
+            && (strnlen(wifiCfg.apSSID, sizeof(wifiCfg.apSSID)) >= 1)
+            && (strnlen(wifiCfg.apSSID, sizeof(wifiCfg.apSSID)) <= 32)
+            && (strnlen(wifiCfg.apPass, sizeof(wifiCfg.apPass)) >= 8)
+            && (strnlen(wifiCfg.apPass, sizeof(wifiCfg.apPass)) <= 64)
+            && (strnlen(wifiCfg.staSSID, sizeof(wifiCfg.staSSID)) <= 32)
+            && (strnlen(wifiCfg.staPass, sizeof(wifiCfg.staPass)) <= 64)
+            && (strnlen(wifiCfg.staSSID, sizeof(wifiCfg.staSSID)) >= 1
+                || wifiCfg.apEnabled == 1
+                || wifiCfg.forceAP == 1);
 
   if (!valid) {
     memset(&wifiCfg, 0, sizeof(wifiCfg));
@@ -1647,7 +1697,7 @@ void handleWifiScanStart() {
 void handleWifiScanResults() {
   if (scanState == SCAN_RUNNING &&
       scanStartMs != 0 &&
-      (millis() - scanStartMs > 45000UL)) {
+      (millis() - scanStartMs > 60000UL)) {
     WiFi.scanDelete();
     scanState   = SCAN_IDLE;
     scanStartMs = 0;
