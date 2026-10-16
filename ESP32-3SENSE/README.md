@@ -1,3 +1,5 @@
+<img src="https://github.com/xiv3r/esp32-plant-care/blob/main/ESP32-3SENSE/esp32-3sense.png">
+
 | Qty | Component | Notes |
 |-----|-----------|-------|
 | 1 | ESP32 DevKit (30/38-pin) | Any ESP32-WROOM-32 board |
