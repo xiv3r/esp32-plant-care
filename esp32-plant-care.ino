@@ -13,6 +13,7 @@
 #include <Preferences.h>
 #include <DHT.h>
 #include <DNSServer.h>
+#include <errno.h>
 
 // -----------------------------
 // Pin definitions
@@ -20,7 +21,6 @@
 #define SOIL_PIN   34         
 #define DHT_PIN    4
 #define DHT_TYPE   DHT22
-
 #define RELAY_PIN  26
 #define RELAY_ON   HIGH
 #define RELAY_OFF  LOW
@@ -40,9 +40,7 @@ struct Config {
   float    tempLimit;       
   uint32_t readIntervalMs;   
 };
-
 Config cfg = { 2500, 150, 35.0f, 2500 };   
-
 #define DRY_MIN   600
 #define DRY_MAX   3400
 #define HYST_MIN  20
@@ -59,7 +57,6 @@ DHT dht(DHT_PIN, DHT_TYPE);
 WebServer server(80);
 Preferences prefs;
 DNSServer dnsServer;
-
 bool     motorStatus  = false;
 int      lastSoil     = -1;         
 float    lastTemp     = NAN;
@@ -68,8 +65,8 @@ bool     faultSoil    = false;
 bool     faultDht     = false;
 uint8_t  overrideMode = 0;         
 uint32_t lastReadMs   = 0;
-bool     apMode       = true;
-
+static uint32_t lastLoopMs     = 0;
+static uint64_t uptimeMsAccum  = 0;
 static char txBuf[512];             
 
 // -----------------------------
@@ -139,19 +136,19 @@ const fmtK=v=>(v/1024).toFixed(1)+' KB';
 function fmtUp(s){const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return(d?d+'d ':'')+h+'h '+m+'m';}
 function render(j){
  $('dot').style.background='var(--ok)';$('net').textContent='live';
- $('soilV').textContent=j.soil<0?'\u2014':j.soil;
+ $('soilV').textContent=j.soil<0?'\u2014':(j.faultSoil?('FAULT ('+j.soil+')'):j.soil);
  $('soilB').style.width=j.soil<0?0:Math.min(100,j.soil/40.95)+'%';
- $('soilB').style.background=j.soil>j.soilDry+j.soilHyst?'var(--bad)':(j.soil<j.soilDry-j.soilHyst?'var(--ok)':'var(--warn)');
+ $('soilB').style.background=(j.soil<0)?'#475569':(j.soil>j.soilDry+j.soilHyst?'var(--bad)':(j.soil<j.soilDry-j.soilHyst?'var(--ok)':'var(--warn)'));
  $('tempV').textContent=j.temp==null?'\u2014':j.temp.toFixed(1)+' \u00B0C';
  $('humV').textContent=j.hum==null?'\u2014':j.hum.toFixed(1)+' %';
  const p=$('pumpV');p.textContent=j.motor?'RUNNING':'OFF';
  p.style.background=j.motor?'var(--ok)':'#475569';p.style.color=j.motor?'#04120a':'#e2e8f0';
  $('bSoil').style.display=j.faultSoil?'block':'none';
  $('bDht').style.display=j.faultDht?'block':'none';
- $('bMan').style.display=j.ovr?'block':'none';
+ $('bMan').style.display=(j.ovr&&!j.faultSoil)?'block':'none';
  [0,1,2].forEach(m=>$('ov'+m).classList.toggle('on',j.ovr===m));
  $('heapV').textContent=fmtK(j.heap);$('heapMinV').textContent=fmtK(j.heapMin);$('heapMaxV').textContent=fmtK(j.heapMax);
- $('rssiV').textContent=j.rssi?j.rssi+' dBm':'\u2014';
+ $('rssiV').textContent=(typeof j.rssi==='number'&&j.rssi!==0)?j.rssi+' dBm':'\u2014';
  $('ipV').textContent=j.ip;$('upV').textContent=fmtUp(j.up);
  if(!dirty){$('iDry').value=j.soilDry;$('iHyst').value=j.soilHyst;$('iTemp').value=j.tempLimit;$('iInt').value=j.interval;}
 }
@@ -164,7 +161,9 @@ async function save(){try{
  $('msg').textContent=r.ok?'Saved \u2713':('Rejected: '+j.err);
  if(r.ok)dirty=false;tick();}catch(e){$('msg').textContent='Network error';}}
 async function ovr(m){try{await fetch('/api/override',{method:'POST',body:new URLSearchParams({mode:m})});tick();}catch(e){}}
-tick();setInterval(tick,2000);
+let ticking=false;
+async function tickSafe(){if(ticking)return;ticking=true;try{await tick();}finally{ticking=false;}}
+tickSafe();setInterval(tickSafe,2000);
 </script></body></html>)rawliteral";
 
 // -----------------------------
@@ -177,8 +176,11 @@ static bool validateConfig(const Config& c, char* err, size_t errlen) {
   if (c.soilHyst < HYST_MIN || c.soilHyst > HYST_MAX) {
     snprintf(err, errlen, "soilHyst must be %d..%d", HYST_MIN, HYST_MAX); return false;
   }
-  if (c.soilDry - c.soilHyst <= 100 || c.soilDry + c.soilHyst >= 3950) {
-    snprintf(err, errlen, "dry/hyst band must stay inside 100..3950"); return false;
+  if (c.soilDry - c.soilHyst <= 100) {
+    snprintf(err, errlen, "dry-hyst must exceed 100"); return false;
+  }
+  if (c.soilDry + c.soilHyst >= 3950) {
+    snprintf(err, errlen, "dry+hyst must stay below 3950"); return false;
   }
   if (!isfinite(c.tempLimit)) {
     snprintf(err, errlen, "tempLimit must be a finite number"); return false;
@@ -208,14 +210,15 @@ void loadCfg() {
     cfg = dflt;
   }
 }
-
-void saveCfg() {
-  prefs.begin("plant", false);
-  prefs.putInt("soilDry",  cfg.soilDry);
-  prefs.putInt("soilHyst", cfg.soilHyst);
-  prefs.putFloat("tempLim", cfg.tempLimit);
-  prefs.putUInt("interval", cfg.readIntervalMs);
+bool saveCfg() {
+  if (!prefs.begin("plant", false)) return false;
+  bool ok = true;
+  ok &= (prefs.putInt("soilDry",  cfg.soilDry)  == sizeof(int32_t));
+  ok &= (prefs.putInt("soilHyst", cfg.soilHyst) == sizeof(int32_t));
+  ok &= (prefs.putFloat("tempLim", cfg.tempLimit) == sizeof(float));
+  ok &= (prefs.putUInt("interval", cfg.readIntervalMs) == sizeof(uint32_t));
   prefs.end();
+  return ok;
 }
 
 // -----------------------------
@@ -247,12 +250,10 @@ void sampleSensors() {
   lastReadMs = millis();
   lastSoil   = analogRead(SOIL_PIN);
   faultSoil  = (lastSoil < 50 || lastSoil > 4000);
-
   float t = dht.readTemperature();
   float h = dht.readHumidity();
   faultDht = (isnan(t) || isnan(h) || isinf(t) || isinf(h));
   if (!faultDht) { lastTemp = t; lastHum = h; }
-
   applyControl();
 }
 
@@ -271,39 +272,43 @@ void handleStatus() {
   else snprintf(tBuf, sizeof(tBuf), "%.1f", (double)lastTemp);
   if (isnan(lastHum))  strcpy(hBuf, "null");
   else snprintf(hBuf, sizeof(hBuf), "%.1f", (double)lastHum);
-
   IPAddress a = WiFi.softAPIP();
   snprintf(ip, sizeof(ip), "%u.%u.%u.%u", a[0], a[1], a[2], a[3]);
-
-  snprintf(txBuf, sizeof(txBuf),
+  int n = snprintf(txBuf, sizeof(txBuf),
     "{\"soil\":%d,\"temp\":%s,\"hum\":%s,\"motor\":%d,\"ovr\":%u,"
     "\"faultSoil\":%d,\"faultDht\":%d,"
     "\"soilDry\":%d,\"soilHyst\":%d,\"tempLimit\":%.1f,\"interval\":%u,"
-    "\"rssi\":%d,\"ip\":\"%s\",\"heap\":%u,\"heapMin\":%u,\"heapMax\":%u,\"up\":%lu}",
+    "\"rssi\":%d,\"ip\":\"%s\",\"heap\":%u,\"heapMin\":%u,\"heapMax\":%u,\"up\":%llu}",
     lastSoil, tBuf, hBuf, motorStatus ? 1 : 0, (unsigned)overrideMode,
     faultSoil ? 1 : 0, faultDht ? 1 : 0,
     (int)cfg.soilDry, (int)cfg.soilHyst, (double)cfg.tempLimit, (unsigned)cfg.readIntervalMs,
     0, ip,
     (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(),
     (unsigned)ESP.getMaxAllocHeap(),
-    (unsigned long)(millis() / 1000UL));
+    (unsigned long long)(uptimeMsAccum / 1000ULL));
+  if (n < 0 || (size_t)n >= sizeof(txBuf)) {
+    server.send(500, "application/json", "{\"ok\":false,\"err\":\"status overflow\"}");
+    return;
+  }
   server.sendHeader(F("Cache-Control"), F("no-cache"));
   server.send(200, "application/json", txBuf);
 }
-
 static bool parseLongField(const String& s, long& out) {
   if (s.length() == 0) return false;
+  errno = 0;
   char* end = nullptr;
   out = strtol(s.c_str(), &end, 10);
+  if (errno == ERANGE) return false;
   return (end != s.c_str() && *end == '\0');
 }
 static bool parseFloatField(const String& s, float& out) {
   if (s.length() == 0) return false;
+  errno = 0;
   char* end = nullptr;
   out = strtof(s.c_str(), &end);
+  if (errno == ERANGE) return false;
   return (end != s.c_str() && *end == '\0');
 }
-
 static void sendErr(int code, const char* msg) {
   snprintf(txBuf, sizeof(txBuf), "{\"ok\":false,\"err\":\"%s\"}", msg);
   server.send(code, "application/json", txBuf);
@@ -313,11 +318,9 @@ void handleSettings() {
   Config c   = cfg;
   char err[96] = "";
   long l; float f;
-
   if (!server.hasArg("soilDry"))           strcpy(err, "missing soilDry");
   else if (!parseLongField(server.arg("soilDry"), l)) strcpy(err, "soilDry not a number");
   else c.soilDry = l;
-
   if (!err[0]) {
     if (!server.hasArg("soilHyst"))        strcpy(err, "missing soilHyst");
     else if (!parseLongField(server.arg("soilHyst"), l)) strcpy(err, "soilHyst not a number");
@@ -333,14 +336,13 @@ void handleSettings() {
     else if (!parseLongField(server.arg("interval"), l)) strcpy(err, "interval not a number");
     else c.readIntervalMs = (uint32_t)l;
   }
-
   if (!err[0]) validateConfig(c, err, sizeof(err));
-
   if (err[0]) { sendErr(400, err); return; }
-
+  Config prev = cfg;
   cfg = c;
-  saveCfg();
+  if (!saveCfg()) { cfg = prev; sendErr(500, "failed to persist settings"); return; }
   applyControl();
+  lastReadMs = millis() - cfg.readIntervalMs;
   snprintf(txBuf, sizeof(txBuf), "{\"ok\":true}");
   server.send(200, "application/json", txBuf);
 }
@@ -376,7 +378,6 @@ void handlePortalRedirect() {
 void wifiInit() {
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASSWORD);
-  apMode = true;
   MDNS.begin("plant");
   dnsServer.start(53, "*", WiFi.softAPIP());
 }
@@ -388,22 +389,17 @@ void setup() {
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, RELAY_OFF);
   Serial.begin(115200);
-
   analogReadResolution(12);
-  analogSetPinAttenuation(SOIL_PIN, ADC_11db);
-
+  analogSetPinAttenuation(SOIL_PIN, ADC_ATTEN_DB_11);
   dht.begin();
   loadCfg();
   delay(2000);
-
   wifiInit();
-
   server.on("/",             HTTP_GET,  handleRoot);
   server.on("/favicon.ico",  HTTP_GET,  handleFavicon);
   server.on("/api/status",   HTTP_GET,  handleStatus);
   server.on("/api/settings", HTTP_POST, handleSettings);
   server.on("/api/override", HTTP_POST, handleOverride);
-
   server.on("/generate_204",              HTTP_GET, handlePortalRedirect);
   server.on("/gen_204",                   HTTP_GET, handlePortalRedirect);
   server.on("/hotspot-detect.html",       HTTP_GET, handlePortalRedirect);
@@ -414,14 +410,19 @@ void setup() {
   server.on("/canonical.html",            HTTP_GET, handlePortalRedirect);
   server.on("/success.txt",               HTTP_GET, handlePortalRedirect);
   server.on("/fwlink",                    HTTP_GET, handlePortalRedirect);
-
   server.onNotFound(handleNotFound);
   server.begin();
-
   lastReadMs = millis() - cfg.readIntervalMs;
 }
 
 void loop() {
+  uint32_t nowLoopMs = millis();
+  if (nowLoopMs < lastLoopMs) {
+    uptimeMsAccum += (uint64_t)0xFFFFFFFFUL - lastLoopMs + nowLoopMs + 1ULL;
+  } else {
+    uptimeMsAccum += (uint64_t)(nowLoopMs - lastLoopMs);
+  }
+  lastLoopMs = nowLoopMs;
   dnsServer.processNextRequest();
   server.handleClient();
   if ((uint32_t)(millis() - lastReadMs) >= cfg.readIntervalMs) {
