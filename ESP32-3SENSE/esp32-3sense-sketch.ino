@@ -359,6 +359,8 @@ const char PAGE_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
 
 <script>
 const fields=["soilDry","soilWet","moistureLow","moistureHigh","tempLow","tempHigh","humLow","humHigh","luxLow","luxHigh","sampleMs","relayMode","sta_ssid","ap_ssid"];
+let formDirty = false;
+
 function cls(v,lo,hi,inv){
   if(v===null||v===undefined||isNaN(v))return "na";
   if(lo!==null&&v<lo)return inv?"warn":"bad";
@@ -397,6 +399,7 @@ function render(d){
   document.getElementById("cards").innerHTML=cards.join("");
 }
 function fill(c){
+  if(formDirty) return;
   for(const f of fields){
     const el=document.querySelector(`[name="${f}"]`);
     if(!el)continue;
@@ -422,18 +425,26 @@ async function poll(){
     const r = await fetch('/api', {signal: ctrl.signal, cache: 'no-store'});
     clearTimeout(to);
     const j = await r.json();
-    render(j); fill(j.cfg);
+    render(j);
+    fill(j.cfg);   
   }catch(e){}
   setTimeout(poll,2000);
 }
 function snap(name){
   fetch('/api').then(r=>r.json()).then(j=>{
     const el=document.querySelector(`[name="${name}"]`);
-    if(el && j && j.readings && j.readings.soilMv !== undefined && j.readings.soilMv !== null)
+    if(el && j && j.readings && j.readings.soilMv !== undefined && j.readings.soilMv !== null){
       el.value=j.readings.soilMv;
+      formDirty = true;  
+    }
   }).catch(()=>{});
 }
-document.getElementById("cfg").addEventListener("submit",async e=>{
+
+const formEl = document.getElementById("cfg");
+formEl.addEventListener("input",  ()=>{ formDirty = true; });
+formEl.addEventListener("change", ()=>{ formDirty = true; });
+
+formEl.addEventListener("submit", async e=>{
   e.preventDefault();
   const fd=new FormData(e.target), o={};
   fd.forEach((v,k)=>o[k]=v);
@@ -444,11 +455,19 @@ document.getElementById("cfg").addEventListener("submit",async e=>{
   o.relayUseLux  = document.querySelector(`[name="relayUseLux"]`).checked  ? "1" : "0";
   try{
     await fetch('/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o)});
+    formDirty = false;
     alert("Saved. Rebooting…");
   }catch(err){
+    formDirty = false;
     alert("Save failed (device may be rebooting).");
   }
 });
+
+const resetBtn = document.querySelector('button.ghost[onclick*="reset"]');
+if(resetBtn){
+  resetBtn.addEventListener('click', ()=>{ formDirty = false; });
+}
+
 poll();
 </script></body></html>)HTML";
 
