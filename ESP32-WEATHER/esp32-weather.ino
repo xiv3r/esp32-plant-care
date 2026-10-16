@@ -1,8 +1,11 @@
 /*
 ===================================================================
  * ESP32 Live Weather Monitoring
- * WiFi AP+STA | Captive Portal | Settings | Factory Reset
- * Comprehensive Weather + Air Quality + 7-Day Forecast
+*  Author: Raff Alds
+*  Github: github.com/xiv3r
+ * Features: WiFi AP+STA | Captive Portal | Settings | Factory Reset
+*  Comprehensive Weather + Air Quality + 7-Day Forecast
+ * WiFi Scan | AP Settings | Uptime Multi-Year
 ===================================================================
 */
 
@@ -15,7 +18,7 @@
 #include <time.h>
 
 // ---------------- CONFIG ----------------
-#define FW_VERSION           "3.2.0"
+#define FW_VERSION           "3.3.0"
 #define AP_SSID              "ESP32_Live_Weather"
 #define AP_PASS              "12345678"
 #define AP_CHANNEL           1
@@ -33,6 +36,7 @@
 #define AIR_REFRESH_MS       900000UL
 #define HTTP_TIMEOUT_MS      10000
 #define MIN_FREE_HEAP        45000
+#define SCAN_MAX_SHOWN       30
 
 // ---------------- STRUCTS ----------------
 struct CurrentWx {
@@ -93,8 +97,10 @@ Preferences   prefs;
 WebServer     server(WEB_PORT);
 DNSServer     dnsServer;
 String        cfgSsid, cfgPass, cfgLat, cfgLon, cfgTz;
+String        cfgApSsid, cfgApPass;
 bool          staConnected = false, apActive = false, portalMode = false;
 unsigned long lastWeatherMs = 0, lastAirMs = 0, bootMs = 0;
+unsigned long bootEpoch = 0;
 unsigned long btnPressStart = 0;
 bool          btnHeld = false, factoryDone = false;
 String        lastWxError = "", lastAqError = "";
@@ -112,6 +118,7 @@ String weatherCodeToText(int);
 String formatLocalTime(time_t, const char*);
 String fmtFloat(float, int);
 String fmtJsonFloat(float, int);
+String authModeToText(wifi_auth_mode_t);
 bool fetchWeather(); bool fetchAirQuality();
 bool jsonFindNumber(const String& body, const String& key, int occurrence, double& out);
 bool jsonExtractNumber(const String& body, const String& key, double& out);
@@ -181,10 +188,14 @@ void loadConfig() {
   cfgLat  = prefs.getString("lat",  String(WEATHER_LAT_DEFAULT, 4));
   cfgLon  = prefs.getString("lon",  String(WEATHER_LON_DEFAULT, 4));
   cfgTz   = prefs.getString("tz",   WEATHER_TZ_DEFAULT);
+  cfgApSsid = prefs.getString("ap_ssid", AP_SSID);
+  cfgApPass = prefs.getString("ap_pass", AP_PASS);
   prefs.end();
   if (cfgLat.length() == 0) cfgLat = String(WEATHER_LAT_DEFAULT, 4);
   if (cfgLon.length() == 0) cfgLon = String(WEATHER_LON_DEFAULT, 4);
   if (cfgTz.length()  == 0) cfgTz  = WEATHER_TZ_DEFAULT;
+  if (cfgApSsid.length() == 0 || cfgApSsid.length() > 32) cfgApSsid = AP_SSID;
+  if (cfgApPass.length() > 63) cfgApPass = AP_PASS;
 }
 
 void saveConfig() {
@@ -192,6 +203,8 @@ void saveConfig() {
   prefs.putString("ssid", cfgSsid); prefs.putString("pass", cfgPass);
   prefs.putString("lat",  cfgLat);  prefs.putString("lon",  cfgLon);
   prefs.putString("tz",   cfgTz);
+  prefs.putString("ap_ssid", cfgApSsid);
+  prefs.putString("ap_pass", cfgApPass);
   prefs.end();
 }
 
@@ -201,6 +214,9 @@ void clearConfig() {
   cfgLat = String(WEATHER_LAT_DEFAULT, 4);
   cfgLon = String(WEATHER_LON_DEFAULT, 4);
   cfgTz  = WEATHER_TZ_DEFAULT;
+  cfgApSsid = AP_SSID;
+  cfgApPass = AP_PASS;
+  bootEpoch = 0;
 }
 
 // ---------------- WIFI ----------------
@@ -216,7 +232,7 @@ void setupWiFi() {
 void startAP() {
   IPAddress ip(192,168,4,1), gw(192,168,4,1), mk(255,255,255,0);
   WiFi.softAPConfig(ip, gw, mk);
-  apActive = WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, AP_HIDDEN, AP_MAX_CONN);
+  apActive = WiFi.softAP(cfgApSsid.c_str(), cfgApPass.c_str(), AP_CHANNEL, AP_HIDDEN, AP_MAX_CONN);
 }
 
 void startSTA() {
@@ -615,6 +631,20 @@ String formatLocalTime(time_t t, const char* fmt) {
 String fmtFloat(float v, int dp) { return isnan(v) ? String("--") : String(v, dp); }
 String fmtJsonFloat(float v, int dp) { return isnan(v) ? String("null") : String(v, dp); }
 
+String authModeToText(wifi_auth_mode_t mode) {
+  switch (mode) {
+    case WIFI_AUTH_OPEN:            return "Open";
+    case WIFI_AUTH_WEP:             return "WEP";
+    case WIFI_AUTH_WPA_PSK:         return "WPA";
+    case WIFI_AUTH_WPA2_PSK:        return "WPA2";
+    case WIFI_AUTH_WPA_WPA2_PSK:    return "WPA/WPA2";
+    case WIFI_AUTH_WPA2_ENTERPRISE: return "WPA2-Ent";
+    case WIFI_AUTH_WPA3_PSK:        return "WPA3";
+    case WIFI_AUTH_WPA2_WPA3_PSK:   return "WPA2/WPA3";
+    default:                        return "?";
+  }
+}
+
 // ---------------- WEB ----------------
 void setupWebServer() {
   server.on("/", HTTP_GET, []() {
@@ -628,8 +658,27 @@ void setupWebServer() {
     b += "<tr><td>STA SSID</td><td>" + htmlEscape(cfgSsid.length()?cfgSsid:String("(none)")) + "</td></tr>";
     b += "<tr><td>STA IP</td><td>"   + (staConnected ? WiFi.localIP().toString() : String("disconnected")) + "</td></tr>";
     b += "<tr><td>RSSI</td><td>"     + (staConnected ? String(WiFi.RSSI()) + " dBm" : String("-")) + "</td></tr>";
-    b += "<tr><td>AP</td><td>"       + String(AP_SSID) + " @ " + WiFi.softAPIP().toString() + "</td></tr>";
-    b += "<tr><td>Uptime</td><td>"   + String((millis()-bootMs)/1000) + " s</td></tr>";
+    b += "<tr><td>AP SSID</td><td>"  + htmlEscape(cfgApSsid) + "</td></tr>";
+    b += "<tr><td>AP IP</td><td>"    + WiFi.softAPIP().toString() + "</td></tr>";
+    if (bootEpoch == 0) {
+      time_t nowEpoch = time(nullptr);
+      if (nowEpoch > 1600000000) bootEpoch = (unsigned long)nowEpoch;
+    }
+    String uptimeStr;
+    if (bootEpoch > 0) {
+      time_t nowEpoch = time(nullptr);
+      unsigned long secs = (nowEpoch > (time_t)bootEpoch) ? (unsigned long)(nowEpoch - (time_t)bootEpoch) : 0;
+      unsigned long days = secs / 86400UL;
+      unsigned long hours = (secs % 86400UL) / 3600UL;
+      unsigned long mins = (secs % 3600UL) / 60UL;
+      unsigned long secsR = secs % 60UL;
+      char upBuf[48];
+      snprintf(upBuf, sizeof(upBuf), "%lud %luh %lum %lus", days, hours, mins, secsR);
+      uptimeStr = String(upBuf);
+    } else {
+      uptimeStr = String((millis()-bootMs)/1000) + " s";
+    }
+    b += "<tr><td>Uptime</td><td>"   + uptimeStr + "</td></tr>";
     b += "<tr><td>Free heap</td><td>"+ String(ESP.getFreeHeap()) + " bytes</td></tr>";
     time_t now = time(nullptr);
     b += "<tr><td>Time</td><td id='clock'>" + formatLocalTime(now, "%H:%M:%S") + "</td></tr>";
@@ -768,7 +817,10 @@ void setupWebServer() {
   });
   server.on("/settings", HTTP_GET, []() {
     String b;
-    b += F("<div class='card'><h2>WiFi Settings</h2><form method='POST' action='/save'>");
+    b += F("<div class='card'><h2>Access Point Settings</h2><form method='POST' action='/save'>");
+    b += "<label>AP SSID</label><input name='ap_ssid' maxlength='32' value='" + htmlEscape(cfgApSsid) + "' required>";
+    b += "<label>AP Password (empty = open, else 8-63)</label><input name='ap_pass' type='password' maxlength='63' value='" + htmlEscape(cfgApPass) + "'>";
+    b += "<h3>Station (Upstream WiFi)</h3>";
     b += "<label>SSID</label><input name='ssid' maxlength='32' value='" + htmlEscape(cfgSsid) + "' required>";
     b += "<label>Password</label><input name='pass' type='password' maxlength='64' value='" + htmlEscape(cfgPass) + "'>";
     b += "<h3>Weather Location</h3>";
@@ -777,20 +829,79 @@ void setupWebServer() {
     b += "<label>Timezone (POSIX or IANA)</label><input name='tz' value='" + htmlEscape(cfgTz) + "' required>";
     b += "<small style='display:block;color:#94a3b8;margin:-6px 0 10px'>Examples: <code>UTC-8</code>, <code>Asia/Manila</code>, <code>America/New_York</code></small>";
     b += F("<button type='submit'>Save &amp; Reconnect</button></form></div>");
+    b += F("<div class='card'><h2>WiFi Scan</h2>"
+           "<p>Scan for nearby WiFi networks to find your STA SSID.</p>"
+           "<a href='/scan'><button type='button'>Open WiFi Scan</button></a></div>");
     b += F("<div class='card'><h2>Danger Zone</h2>"
            "<form method='POST' action='/factory' onsubmit=\"return confirm('Factory reset?');\">"
            "<button class='danger' type='submit'>Factory Reset</button></form></div>");
     server.send(200, "text/html", htmlPage(b, "Settings"));
   });
+  server.on("/scan", HTTP_GET, []() {
+    String b;
+    b += F("<div class='card'><h2>Nearby WiFi Networks</h2>");
+    int n = WiFi.scanNetworks(false, false, false, 300);
+    if (n < 0) {
+      b += F("<p>Scan failed. Try again.</p>");
+    } else if (n == 0) {
+      b += F("<p>No networks found. Try again.</p>");
+    } else {
+      int shown = n > SCAN_MAX_SHOWN ? SCAN_MAX_SHOWN : n;
+      b += F("<table><tr><th>SSID</th><th>Signal</th><th>Ch</th><th>Security</th></tr>");
+      for (int i = 0; i < shown; i++) {
+        String ssid = WiFi.SSID(i);
+        if (ssid.length() == 0) ssid = "(hidden)";
+        int32_t rssi = WiFi.RSSI(i);
+        int32_t ch = WiFi.channel(i);
+        String sec = authModeToText(WiFi.encryptionType(i));
+        int bars = 0;
+        if (rssi >= -50) bars = 4;
+        else if (rssi >= -60) bars = 3;
+        else if (rssi >= -70) bars = 2;
+        else if (rssi >= -80) bars = 1;
+        String bar;
+        for (int j = 0; j < 4; j++) {
+          bar += (j < bars) ? "&#9608;" : "&#9617;";
+        }
+        b += "<tr>";
+        b += "<td>" + htmlEscape(ssid) + "</td>";
+        b += "<td>" + String((long)rssi) + " dBm " + bar + "</td>";
+        b += "<td>" + String((long)ch) + "</td>";
+        b += "<td>" + sec + "</td>";
+        b += "</tr>";
+      }
+      b += F("</table>");
+      if (n > SCAN_MAX_SHOWN) b += "<p>Showing top " + String(SCAN_MAX_SHOWN) + " of " + String(n) + " networks.</p>";
+    }
+    WiFi.scanDelete();
+    b += F("<p><a href='/scan'><button type='button'>Scan Again</button></a></p>");
+    b += F("<p><a href='/settings'><button type='button'>Back to Settings</button></a></p>");
+    b += F("</div>");
+    server.send(200, "text/html", htmlPage(b, "WiFi Scan"));
+  });
   server.on("/save", HTTP_POST, []() {
+    String as= server.arg("ap_ssid"); as.trim();
+    String ap= server.arg("ap_pass");
     String s = server.arg("ssid"); s.trim();
     String p = server.arg("pass"); p.trim();
     String la= server.arg("lat");  la.trim();
     String lo= server.arg("lon");  lo.trim();
     String tz= server.arg("tz");   tz.trim();
-    if (s.length() == 0) {
-      server.send(400, "text/html", htmlPage("<p>SSID required.</p><a href='/settings'>Back</a>", "Error")); return;
+    if (as.length() < 1 || as.length() > 32) {
+      server.send(400, "text/html", htmlPage("<p>AP SSID must be 1-32 characters.</p><a href='/settings'>Back</a>", "Error")); return;
     }
+    if (ap.length() != 0 && (ap.length() < 8 || ap.length() > 63)) {
+      server.send(400, "text/html", htmlPage("<p>AP password must be empty (open) or 8-63 characters.</p><a href='/settings'>Back</a>", "Error")); return;
+    }
+    if (s.length() == 0) {
+      server.send(400, "text/html", htmlPage("<p>STA SSID required.</p><a href='/settings'>Back</a>", "Error")); return;
+    }
+    if (as == s) {
+      server.send(400, "text/html", htmlPage("<p>AP SSID and STA SSID must be different.</p><a href='/settings'>Back</a>", "Error")); return;
+    }
+    bool apChanged = (cfgApSsid != as) || (cfgApPass != ap);
+    cfgApSsid = as;
+    cfgApPass = ap;
     cfgSsid=s; cfgPass=p;
     if (la.length()) {
       char* endp = nullptr;
@@ -806,8 +917,21 @@ void setupWebServer() {
     saveConfig(); applyTimezone();
     setenv("TZ", ianaToPosix(cfgTz).c_str(), 1);
     tzset();
-    server.send(200, "text/html",
-      htmlPage("<p>Saved. Reconnecting...</p><script>setTimeout(()=>location='/',4000);</script>", "Saved"));
+    if (apChanged) {
+      String msg = "<p>Saved. AP restarting with new credentials.</p>";
+      msg += "<p>Reconnect to SSID: <b>" + htmlEscape(cfgApSsid) + "</b></p>";
+      msg += "<script>setTimeout(()=>location='/',8000);</script>";
+      server.send(200, "text/html", htmlPage(msg, "Saved"));
+      delay(600);
+      WiFi.softAPdisconnect(true);
+      delay(300);
+      startAP();
+      dnsServer.stop();
+      if (apActive) dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
+    } else {
+      server.send(200, "text/html",
+        htmlPage("<p>Saved. Reconnecting...</p><script>setTimeout(()=>location='/',4000);</script>", "Saved"));
+    }
     delay(400);
     WiFi.disconnect(false, false);
     staConnected=false; portalMode=true;
@@ -838,7 +962,14 @@ String makeStatusJson() {
   j += "\"ssid\":\""   + jsonEscape(cfgSsid) + "\",";
   j += "\"sta\":\""    + (staConnected ? WiFi.localIP().toString() : String("")) + "\",";
   j += "\"rssi\":"     + String(staConnected ? WiFi.RSSI() : 0) + ",";
-  j += "\"uptime\":"   + String((millis()-bootMs)/1000) + ",";
+  unsigned long upSecs;
+  if (bootEpoch > 0) {
+    time_t nE = time(nullptr);
+    upSecs = (nE > (time_t)bootEpoch) ? (unsigned long)(nE - (time_t)bootEpoch) : 0;
+  } else {
+    upSecs = (millis() - bootMs) / 1000;
+  }
+  j += "\"uptime\":"   + String(upSecs) + ",";
   j += "\"heap\":"     + String(ESP.getFreeHeap()) + ",";
   j += "\"time\":\""   + formatLocalTime(now, "%H:%M:%S") + "\",";
   j += "\"date\":\""   + formatLocalTime(now, "%Y-%m-%d") + "\",";
@@ -938,7 +1069,7 @@ String htmlPage(const String& body, const String& title) {
          "input{background:#f8fafc;color:#0f172a;border:1px solid #cbd5e1}"
          "}"
          "</style></head><body>");
-  p += F("<div class='nav'><a href='/'>Dashboard</a><a href='/settings'>Settings</a></div>");
+  p += F("<div class='nav'><a href='/'>Dashboard</a><a href='/settings'>Settings</a><a href='/scan'>WiFi Scan</a></div>");
   p += "<h1>" + htmlEscape(title) + "</h1>";
   p += body;
   p += F("</body></html>");
