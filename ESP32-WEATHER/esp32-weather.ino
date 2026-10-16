@@ -1,11 +1,11 @@
 /*
 ===================================================================
- * ESP32 Live Weather Monitoring
+*  ESP32 Live Weather Monitoring
 *  Author: Raff Alds
 *  Github: github.com/xiv3r
- * Features: WiFi AP+STA | Captive Portal | Settings | Factory Reset
+*  Features: WiFi AP+STA | Captive Portal | Settings | Factory Reset
 *  Comprehensive Weather + Air Quality + 7-Day Forecast
- * WiFi Scan | AP Settings | Uptime Multi-Year
+*  WiFi Scan | AP Settings | Uptime Multi-Year
 ===================================================================
 */
 
