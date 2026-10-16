@@ -1,250 +1,133 @@
+| Qty | Component | Notes |
+|-----|-----------|-------|
+| 1 | ESP32 DevKit (30/38-pin) | Any ESP32-WROOM-32 board |
+| 1 | Capacitive Soil Moisture Sensor v2.0 | Analog output |
+| 1 | SHT31 temperature/humidity sensor | I²C, address 0x44 or 0x45 |
+| 1 | BH1750 light sensor | I²C, address 0x23 or 0x5C |
+| 1 | Relay module (1-channel) | 3.3 V logic-compatible preferred |
+| 1 | Push button | For factory reset |
+| — | Jumper wires, breadboard/PCB | — |
 
 ---
 
-## 1 Components Needed
+## ESP32 Pin Map
 
-| # | Component | Notes |
-|---|---|---|
-| 1 | ESP32 DevKit (30 or 38 pin) | Any standard ESP32 with WiFi |
-| 2 | Capacitive Soil Moisture Sensor v2.0 | 3-pin analog output (AOUT) |
-| 3 | SHT31 temperature + humidity sensor | I2C breakout (Adafruit or generic) |
-| 4 | BH1750 light sensor (GY-302 or similar) | I2C breakout |
-| 5 | Jumper wires | Female-to-female, ~10 cm |
-| 6 | USB cable | Micro-USB or USB-C depending on board |
-| 7 | (Optional) 100 kΩ resistor | Pull-down for soil pin if sensor disconnected |
-| 8 | (Optional) Breadboard | For stable connections |
-
-**Note on voltage:** All three sensors are 3.3 V compatible. **Do NOT power them from 5 V** — GPIO34 is not 5 V tolerant.
+| GPIO | Function | Firmware define |
+|------|----------|-----------------|
+| GPIO 34 | Soil moisture analog input | `SOIL_PIN` |
+| GPIO 21 | I²C SDA | `I2C_SDA` |
+| GPIO 22 | I²C SCL | `I2C_SCL` |
+| GPIO 25 | Relay control output | `RELAY_PIN` |
+| GPIO 0 | Boot / factory-reset button | `BOOT_BTN_PIN` |
 
 ---
 
-## 2 Pin Map (ESP32 side)
+## 1. Capacitive Soil Moisture Sensor v2.0
 
-| ESP32 Pin | GPIO | Function | Connects To |
-|---|---|---|---|
-| 3V3 | — | 3.3 V power | SHT31 VIN, BH1750 VCC, Soil VCC |
-| GND | — | Ground | SHT31 GND, BH1750 GND, Soil GND |
-| D34 | GPIO34 | ADC1_CH6 (analog in) | Soil sensor AOUT |
-| D21 | GPIO21 | I2C SDA | SHT31 SDA, BH1750 SDA |
-| D22 | GPIO22 | I2C SCL | SHT31 SCL, BH1750 SCL |
-| D0 / BOOT | GPIO0 | Factory reset button | Onboard BOOT button (no wiring needed) |
+| Sensor pin | ESP32 pin | Notes |
+|------------|-----------|-------|
+| VCC | 3V3 | **Do not use 5 V** — sensor output would exceed ADC range |
+| GND | GND | Common ground |
+| AOUT | GPIO 34 | ADC1 channel, input-only pin |
 
-**Why GPIO34?** Input-only pin, part of **ADC1**. Wi-Fi uses ADC2 on ESP32, so ADC1 is required for reliable readings while WiFi is active.
+> **Important:** GPIO 34 is input-only and belongs to ADC1. ADC2 pins cannot be used while WiFi is active, so GPIO 34 is the correct choice. The firmware sets `ADC_11db` attenuation for ~0–3.3 V range.
 
 ---
 
-## 3 Sensor Pin-outs
+## 2. SHT31 Temperature / Humidity Sensor (I²C)
 
-### 3.1 Capacitive Soil Moisture Sensor v2.0
+| SHT31 pin | ESP32 pin | Notes |
+|-----------|-----------|-------|
+| VIN / VCC | 3V3 | 3.3 V |
+| GND | GND | Common ground |
+| SDA | GPIO 21 | Shared I²C bus |
+| SCL | GPIO 22 | Shared I²C bus |
+| ADDR | GND (or floating) | GND → 0x44 (default), VCC → 0x45 |
 
-| Pin (silkscreen) | Meaning | Wire to |
-|---|---|---|
-| VCC | Power (3.3–5 V; use 3.3 V) | ESP32 3V3 |
-| GND | Ground | ESP32 GND |
-| AOUT | Analog output (0–3.0 V) | ESP32 GPIO34 |
-
-**Important:** This sensor has a **3-pin JST or 3-pin header**. Older resistive sensors have 4 pins — this guide assumes the 3-pin capacitive v2.0.
-
-### 3.2 SHT31 (I2C Temperature + Humidity)
-
-| Pin (silkscreen) | Meaning | Wire to |
-|---|---|---|
-| VIN / VCC | Power (3.3 V) | ESP32 3V3 |
-| GND | Ground | ESP32 GND |
-| SDA | I2C data | ESP32 GPIO21 |
-| SCL | I2C clock | ESP32 GPIO22 |
-| ADDR | Address select (leave floating = 0x44; tie to GND = 0x44; tie to VIN = 0x45) | Leave unconnected |
-
-**Note:** Some SHT31 breakouts label pins as `VCC/VIN` or `3V3`. **Do not connect to 5 V.**
-
-### 3.3 BH1750 (I2C Light Sensor)
-
-| Pin (silkscreen) | Meaning | Wire to |
-|---|---|---|
-| VCC | Power (3.3 V) | ESP32 3V3 |
-| GND | Ground | ESP32 GND |
-| SDA | I2C data | ESP32 GPIO21 |
-| SCL | I2C clock | ESP32 GPIO22 |
-| ADDR | Address select (leave floating = 0x23; tie to VCC = 0x5C) | Leave unconnected |
-
-**Note:** BH1750 breakout pin order may vary by manufacturer. Verify silkscreen labels before connecting.
+The firmware tries **0x44 first, then 0x45**, so either address works.
 
 ---
 
-## 4 Simplified Wiring Table
+## 3. BH1750 Light Sensor (I²C)
 
-Just connect each sensor to the ESP32 directly:
+| BH1750 pin | ESP32 pin | Notes |
+|------------|-----------|-------|
+| VCC | 3V3 | 3.3 V |
+| GND | GND | Common ground |
+| SDA | GPIO 21 | Shared with SHT31 |
+| SCL | GPIO 22 | Shared with SHT31 |
+| ADDR | GND (or floating) | GND → 0x23 (default), VCC → 0x5C |
 
-### Soil Sensor → ESP32
+The firmware tries **0x23 first, then 0x5C**, so either address works.
 
-| Soil Pin | ESP32 Pin |
-|---|---|
-| VCC | 3V3 |
-| GND | GND |
-| AOUT | GPIO34 |
-
-### SHT31 → ESP32
-
-| SHT31 Pin | ESP32 Pin |
-|---|---|
-| VIN | 3V3 |
-| GND | GND |
-| SDA | GPIO21 |
-| SCL | GPIO22 |
-| ADDR | (leave unconnected) |
-
-### BH1750 → ESP32
-
-| BH1750 Pin | ESP32 Pin |
-|---|---|
-| VCC | 3V3 |
-| GND | GND |
-| SDA | GPIO21 (shared with SHT31) |
-| SCL | GPIO22 (shared with SHT31) |
-| ADDR | (leave unconnected) |
-
-**I2C bus is shared:** SHT31 and BH1750 both connect to GPIO21 (SDA) and GPIO22 (SCL). They have different I2C addresses (0x44/0x45 vs 0x23/0x5C), so no conflict.
-
----
-
-## 5 Connection Summary (all in one table)
-
-| ESP32 Pin | Soil Sensor | SHT31 | BH1750 |
-|---|---|---|---|
-| 3V3 | VCC | VIN | VCC |
-| GND | GND | GND | GND |
-| GPIO34 | AOUT | — | — |
-| GPIO21 | — | SDA | SDA |
-| GPIO22 | — | SCL | SCL |
-| GPIO0 (BOOT) | — | — | — |
-
----
-
-## 6 Assembly Steps
-
-1. **Power off ESP32** (unplug USB).
-2. **Connect soil sensor:**
-   - VCC → ESP32 3V3
-   - GND → ESP32 GND
-   - AOUT → ESP32 GPIO34
-3. **Connect SHT31:**
-   - VIN → ESP32 3V3
-   - GND → ESP32 GND
-   - SDA → ESP32 GPIO21
-   - SCL → ESP32 GPIO22
-   - Leave ADDR floating
-4. **Connect BH1750:**
-   - VCC → ESP32 3V3
-   - GND → ESP32 GND
-   - SDA → ESP32 GPIO21 (same node as SHT31 SDA)
-   - SCL → ESP32 GPIO22 (same node as SHT31 SCL)
-   - Leave ADDR floating
-5. **Double-check all GND connections** are common.
-6. **Power on** via USB.
-
----
-
-### 7 Live readings
-
-Every sample interval, you should see:
-```
-soil=2450mV (3.8%) temp=22.5C hum=48.3% lux=340
-```
-
-If soil shows `nan` → sensor uncalibrated (expected on first boot)
-If temp/hum/lux show `nan` → sensor not detected
-
-### 7.1 Dashboard
-
-1. Connect phone/PC to `PlantMonitor-XXXX` AP
-2. Open `http://192.168.4.1/`
-3. Dashboard should show 4 cards with live values
-
----
-
-## 8 Safety Notes
-
-| Warning | Reason |
-|---|---|
-| **Never feed 5 V to any sensor** | ESP32 GPIOs are 3.3 V; 5 V will damage the ADC pin |
-| **Do not connect 5 V to SHT31/BH1750 VCC** | They may tolerate 5 V (check datasheet) but 3.3 V is required for I2C logic levels |
-| **Keep soil sensor cable dry** | Water on the connector can short pins |
-| **Do not insert soil sensor into liquid above the marked line** | The v2.0 sensor has a "water line" marking; only the probe tip should be submerged |
-| **Ensure common ground** | All sensors must share GND with ESP32 |
-| **Check I2C pull-ups** | Most breakouts have built-in 4.7 kΩ pull-ups. If chaining multiple I2C boards, total pull-up = parallel — usually fine at 100 kHz |
-
----
-
-## 9 Optional Additions
-
-### 9.1 External BOOT button (if your board doesn't have one)
-
-If your ESP32 board lacks an onboard BOOT button:
+### I²C Bus Summary
 
 ```
-GPIO0 ──────[ Button ]────── GND
+ESP32 GPIO 21 (SDA) ──┬── SHT31 SDA
+                      └── BH1750 SDA
+
+ESP32 GPIO 22 (SCL) ──┬── SHT31 SCL
+                      └── BH1750 SCL
+
+ESP32 3V3 ────────────┬── SHT31 VCC
+                      └── BH1750 VCC
+
+ESP32 GND ────────────┴── SHT31 GND, BH1750 GND, Soil GND, Relay GND
 ```
 
-The internal pull-up keeps GPIO0 HIGH when not pressed. **No external resistor needed.**
-
-### 9.2 Soil pin pull-down (recommended for stability)
-
-If the soil sensor is disconnected, GPIO34 floats. Adding a pull-down gives a defined 0 mV reading:
-
-```
-GPIO34 ──────┬────── Soil AOUT
-             │
-           [100kΩ]
-             │
-            GND
-```
-
-### 9.3 Decoupling capacitors (optional)
-
-For noisy environments, add a 100 nF ceramic capacitor between 3V3 and GND near each sensor.
-
-### 9.4 External antenna (if board supports it)
-
-Not needed for typical indoor plant monitoring range.
+> Both sensors share the same bus at 100 kHz (`I2C_FREQ = 100000`). Pull-up resistors are usually already present on the breakout boards. If not, add 4.7 kΩ from SDA→3V3 and SCL→3V3.
 
 ---
 
-## 10 Final Checklist
+## 4. Relay Module
 
-Before powering on, verify:
+| Relay module pin | ESP32 pin | Notes |
+|------------------|-----------|-------|
+| VCC | 5V (VIN) or 3V3 | Depends on module — see below |
+| GND | GND | Common ground |
+| IN | GPIO 25 | Control signal |
 
-- [ ] Soil VCC → 3V3 (not 5 V)
-- [ ] Soil GND → GND
-- [ ] Soil AOUT → GPIO34
-- [ ] SHT31 VIN → 3V3
-- [ ] SHT31 GND → GND
-- [ ] SHT31 SDA → GPIO21
-- [ ] SHT31 SCL → GPIO22
-- [ ] SHT31 ADDR → not connected
-- [ ] BH1750 VCC → 3V3
-- [ ] BH1750 GND → GND
-- [ ] BH1750 SDA → GPIO21 (same node as SHT31 SDA)
-- [ ] BH1750 SCL → GPIO22 (same node as SHT31 SCL)
-- [ ] BH1750 ADDR → not connected
-- [ ] All GND connections common with ESP32
-- [ ] No 5 V connections anywhere
-- [ ] Wires firmly seated
+### Relay logic
 
-Power on and check Serial Monitor for the boot messages.
+The firmware uses **active-LOW logic by default**:
+
+```cpp
+void setRelayOutput(bool on) {
+  bool highLevel;
+  if (cfg.relayInvert) {
+    highLevel = on;        // invert OFF → active-HIGH module
+  } else {
+    highLevel = !on;       // default → active-LOW module
+  }
+  digitalWrite(RELAY_PIN, highLevel ? HIGH : LOW);
+  r.relayState = on;
+}
+```
+
+| Module type | `relayInvert` setting | GPIO 25 = LOW | GPIO 25 = HIGH |
+|-------------|----------------------|---------------|----------------|
+| Active-LOW (most common) | `false` (default) | Relay **ON** | Relay **OFF** |
+| Active-HIGH | `true` | Relay **OFF** | Relay **ON** |
+
+> **Boot safety:** In `setup()`, the pin is first driven to the "off" level (`cfg.relayInvert ? LOW : HIGH`) before `setRelayOutput()` is called, preventing a momentary relay click on power-up.
+
+### Powering the relay
+
+- **3.3 V-compatible relay modules** (opto-isolated, with own transistor): power VCC from **3V3**, signal from GPIO 25.
+- **5 V relay modules**: power VCC from **5 V / VIN**, but **check that the IN pin accepts 3.3 V logic**. Many 5 V modules have a threshold near 3 V and work; if not, use a level shifter or a transistor driver.
+- If the relay coil draws significant current, power it from a **separate 5 V supply** with a common ground to the ESP32.
 
 ---
 
-## 11 Troubleshooting Quick Reference
+## 5. Boot / Factory-Reset Button
 
-| Symptom | Likely Cause | Fix |
-|---|---|---|
-| `SHT31 NOT FOUND` | SDA/SCL swapped or loose | Verify GPIO21=SDA, GPIO22=SCL |
-| `BH1750 NOT FOUND` | Same as above, or I2C address conflict | Check ADDR pin |
-| `soil=0mV` always | Sensor unplugged or AOUT wire loose | Verify GPIO34 connection |
-| `soil=3300mV` always | AOUT shorted to VCC | Inspect wiring |
-| No serial output | Wrong baud or wrong USB driver | Set 115200, install CP210x/CH340 driver |
-| Can't connect to AP | Board in STA mode | Check Serial for `STA IP:` message |
-| Dashboard shows `—` for values | Sensor not detected | Check serial for `NOT FOUND` |
-| Values wildly fluctuate | Loose connections or noise | Solder connections, add pull-down |
+| Button | ESP32 pin | Notes |
+|--------|-----------|-------|
+| One side | GPIO 0 | Internal pull-up enabled (`INPUT_PULLUP`) |
+| Other side | GND | |
+
+- The **on-board BOOT button** already connects GPIO 0 to GND — no external button required.
+- Hold for **5 seconds** (`BOOT_BTN_HOLD_MS`) to trigger a factory reset.
+- The firmware arms the button only after it has seen a released state, so it won't trigger if held during power-up.
 
 ---
