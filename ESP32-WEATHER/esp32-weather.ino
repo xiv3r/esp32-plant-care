@@ -103,6 +103,7 @@ String        lastWxError = "", lastAqError = "";
 void setupWiFi(); void setupWebServer(); void setupDNS(); void handleBootButton();
 void loadConfig(); void saveConfig(); void clearConfig();
 void startAP(); void startSTA(); void applyTimezone();
+String ianaToPosix(const String&);
 String htmlPage(const String&, const String&);
 String makeStatusJson();
 String urlEncode(const String&); String htmlEscape(const String&);
@@ -133,6 +134,8 @@ void setup() {
   setupWebServer();
   server.begin();
   applyTimezone();
+  setenv("TZ", ianaToPosix(cfgTz).c_str(), 1);
+  tzset();
   if (staConnected) {
     fetchWeather(); fetchAirQuality();
     lastWeatherMs = millis(); lastAirMs = millis();
@@ -151,7 +154,7 @@ void loop() {
     fetchAirQuality(); lastAirMs = millis();
   }
   static unsigned long lastStaCheck = 0;
-  static bool wasStaConnected = false;
+  static bool wasStaConnected = true;
   if (millis() - lastStaCheck > 15000) {
     lastStaCheck = millis();
     if (cfgSsid.length() > 0 && WiFi.status() != WL_CONNECTED) {
@@ -562,8 +565,46 @@ bool fetchAirQuality() {
 }
 
 // ---------------- TIME / FORMAT ----------------
+String ianaToPosix(const String& tz) {
+  if (tz.length() == 0) return String("UTC0");
+  if (tz.indexOf('/') < 0) return tz;
+  if (tz == "Asia/Manila")      return "UTC-8";
+  if (tz == "Asia/Singapore")   return "UTC-8";
+  if (tz == "Asia/Hong_Kong")   return "UTC-8";
+  if (tz == "Asia/Shanghai")    return "UTC-8";
+  if (tz == "Asia/Taipei")      return "UTC-8";
+  if (tz == "Asia/Tokyo")       return "UTC-9";
+  if (tz == "Asia/Seoul")       return "UTC-9";
+  if (tz == "Asia/Kolkata")     return "UTC-5:30";
+  if (tz == "Asia/Karachi")     return "UTC-5";
+  if (tz == "Asia/Dubai")       return "UTC-4";
+  if (tz == "Asia/Bangkok")     return "UTC-7";
+  if (tz == "Asia/Jakarta")     return "UTC-7";
+  if (tz == "Australia/Sydney") return "AEST-10AEDT,M10.1.0,M4.1.0/3";
+  if (tz == "Australia/Perth")  return "UTC-8";
+  if (tz == "Pacific/Auckland") return "NZST-12NZDT,M9.5.0,M4.1.0/3";
+  if (tz == "Europe/London")    return "GMT0BST,M3.5.0/1,M10.5.0";
+  if (tz == "Europe/Paris")     return "CET-1CEST,M3.5.0,M10.5.0/3";
+  if (tz == "Europe/Berlin")    return "CET-1CEST,M3.5.0,M10.5.0/3";
+  if (tz == "Europe/Madrid")    return "CET-1CEST,M3.5.0,M10.5.0/3";
+  if (tz == "Europe/Rome")      return "CET-1CEST,M3.5.0,M10.5.0/3";
+  if (tz == "Europe/Moscow")    return "MSK-3";
+  if (tz == "America/New_York") return "EST5EDT,M3.2.0,M11.1.0";
+  if (tz == "America/Chicago")  return "CST6CDT,M3.2.0,M11.1.0";
+  if (tz == "America/Denver")   return "MST7MDT,M3.2.0,M11.1.0";
+  if (tz == "America/Los_Angeles") return "PST8PDT,M3.2.0,M11.1.0";
+  if (tz == "America/Sao_Paulo")   return "UTC3";
+  if (tz == "America/Mexico_City") return "CST6";
+  if (tz == "Africa/Cairo")     return "EET-2EEST,M4.5.5/0,M10.5.4/24";
+  if (tz == "Africa/Johannesburg") return "SAST-2";
+  if (tz == "Africa/Lagos")     return "WAT-1";
+  if (tz == "UTC")              return "UTC0";
+  if (tz == "GMT")              return "GMT0";
+  return tz;
+}
 void applyTimezone() {
-  configTzTime(cfgTz.c_str(), "pool.ntp.org", "time.nist.gov", "time.google.com");
+  String posix = ianaToPosix(cfgTz);
+  configTzTime(posix.c_str(), "pool.ntp.org", "time.nist.gov", "time.google.com");
 }
 String formatLocalTime(time_t t, const char* fmt) {
   if (t < 1600000000) return String("--");
@@ -733,7 +774,8 @@ void setupWebServer() {
     b += "<h3>Weather Location</h3>";
     b += "<label>Latitude</label><input name='lat' value='" + htmlEscape(cfgLat) + "' required>";
     b += "<label>Longitude</label><input name='lon' value='" + htmlEscape(cfgLon) + "' required>";
-    b += "<label>Timezone</label><input name='tz' value='" + htmlEscape(cfgTz) + "' required>";
+    b += "<label>Timezone (POSIX or IANA)</label><input name='tz' value='" + htmlEscape(cfgTz) + "' required>";
+    b += "<small style='display:block;color:#94a3b8;margin:-6px 0 10px'>Examples: <code>UTC-8</code>, <code>Asia/Manila</code>, <code>America/New_York</code></small>";
     b += F("<button type='submit'>Save &amp; Reconnect</button></form></div>");
     b += F("<div class='card'><h2>Danger Zone</h2>"
            "<form method='POST' action='/factory' onsubmit=\"return confirm('Factory reset?');\">"
@@ -762,6 +804,8 @@ void setupWebServer() {
     }
     if (tz.length()) cfgTz=tz;
     saveConfig(); applyTimezone();
+    setenv("TZ", ianaToPosix(cfgTz).c_str(), 1);
+    tzset();
     server.send(200, "text/html",
       htmlPage("<p>Saved. Reconnecting...</p><script>setTimeout(()=>location='/',4000);</script>", "Saved"));
     delay(400);
