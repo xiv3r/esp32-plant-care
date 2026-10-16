@@ -1,3 +1,5 @@
+<img src="https://github.com/xiv3r/esp32-plant-care/blob/main/esp32-plant-care.png">
+
 ## Components Required
 
 | Qty | Component |
