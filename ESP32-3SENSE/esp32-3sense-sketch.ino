@@ -1,10 +1,10 @@
 /*
-******************************************************
+*******************************************************
  * ESP32 Plant Monitor
  * Sensors: Capacitive Soil v2.0 + SHT31 + BH1750
- * Features: Web dashboard, settings, calibration, NVS persistence, captive portal
-******************************************************
- */
+ * Features: Web dashboard, settings, calibration, NVS persistence, captive portal, relay control
+********************************************************
+*/
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -16,16 +16,20 @@
 #include <DNSServer.h>
 
 // ---------- Configuration ----------
-#define SOIL_PIN        34        
+#define SOIL_PIN        34
 #define I2C_SDA         21
 #define I2C_SCL         22
-#define I2C_FREQ        100000    
-
-#define SAMPLE_INTERVAL_MS  2000  
-#define SOIL_SAMPLES        16    
+#define I2C_FREQ        100000
+#define SAMPLE_INTERVAL_MS  2000
+#define SOIL_SAMPLES        16
 #define AP_SSID_PREFIX      "PlantMonitor"
 #define BOOT_BTN_PIN        0
 #define BOOT_BTN_HOLD_MS    5000
+#define RELAY_PIN           25
+#define RELAY_MODE_OFF      0
+#define RELAY_MODE_AUTO     1
+#define RELAY_MODE_ON       2
+#define RELAY_MODE_OFF_MAN  3
 
 // ---------- Globals ----------
 WebServer server(80);
@@ -40,10 +44,10 @@ struct Settings {
   char sta_pass[65]   = "";
   char ap_ssid[33]    = "";
   char ap_pass[65]    = "";
-  uint16_t soilDryMv  = 2500;   
-  uint16_t soilWetMv  = 1200;   
-  int8_t   moistureLow  = 30;   
-  int8_t   moistureHigh = 70;   
+  uint16_t soilDryMv  = 2500;
+  uint16_t soilWetMv  = 1200;
+  int8_t   moistureLow  = 30;
+  int8_t   moistureHigh = 70;
   float    tempLow    = 15.0f;
   float    tempHigh   = 30.0f;
   float    humLow     = 30.0f;
@@ -51,6 +55,12 @@ struct Settings {
   uint16_t luxLow     = 200;
   uint16_t luxHigh    = 20000;
   uint16_t sampleMs   = SAMPLE_INTERVAL_MS;
+  uint8_t  relayMode  = RELAY_MODE_OFF;
+  bool     relayInvert = false;
+  bool     relayUseSoil = true;
+  bool     relayUseTemp = false;
+  bool     relayUseHum  = false;
+  bool     relayUseLux  = false;
 } cfg;
 struct Readings {
   float soilPct   = NAN;
@@ -60,9 +70,11 @@ struct Readings {
   float lux       = NAN;
   uint32_t lastMs = 0;
   bool  valid     = false;
+  bool  relayState = false;
 } r;
 unsigned long lastSample = 0;
 bool bootBtnArmed = false;
+bool bootBtnActive = false;
 unsigned long bootBtnPressedAt = 0;
 DNSServer dnsServer;
 bool apModeActive = false;
@@ -70,7 +82,50 @@ bool i2cLock(uint32_t ms = 200) {
   if (i2cMutex == nullptr) return false;
   return xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(ms)) == pdTRUE;
 }
-void i2cUnlock() { xSemaphoreGive(i2cMutex); }
+void i2cUnlock() { if (i2cMutex != nullptr) xSemaphoreGive(i2cMutex); }
+void setRelayOutput(bool on) {
+  bool highLevel;
+  if (cfg.relayInvert) {
+    highLevel = on;
+  } else {
+    highLevel = !on;
+  }
+  digitalWrite(RELAY_PIN, highLevel ? HIGH : LOW);
+  r.relayState = on;
+}
+void applyRelay() {
+  bool on = false;
+  if (cfg.relayMode == RELAY_MODE_ON) {
+    on = true;
+  } else if (cfg.relayMode == RELAY_MODE_OFF_MAN) {
+    on = false;
+  } else if (cfg.relayMode == RELAY_MODE_AUTO) {
+    bool wantOn = false;
+    bool wantOff = false;
+    if (cfg.relayUseSoil && r.valid && !isnan(r.soilPct)) {
+      if (r.soilPct < cfg.moistureLow)  wantOn = true;
+      if (r.soilPct > cfg.moistureHigh) wantOff = true;
+    }
+    if (cfg.relayUseTemp && !isnan(r.tempC)) {
+      if (r.tempC < cfg.tempLow)  wantOn = true;
+      if (r.tempC > cfg.tempHigh) wantOff = true;
+    }
+    if (cfg.relayUseHum && !isnan(r.humPct)) {
+      if (r.humPct < cfg.humLow)  wantOn = true;
+      if (r.humPct > cfg.humHigh) wantOff = true;
+    }
+    if (cfg.relayUseLux && !isnan(r.lux)) {
+      if (r.lux < cfg.luxLow)  wantOn = true;
+      if (r.lux > cfg.luxHigh) wantOff = true;
+    }
+    if (wantOff) on = false;
+    else if (wantOn) on = true;
+    else on = r.relayState;
+  } else {
+    on = false;
+  }
+  setRelayOutput(on);
+}
 uint16_t readSoilMillivolts() {
   uint16_t buf[SOIL_SAMPLES];
   for (int i = 0; i < SOIL_SAMPLES; i++) {
@@ -82,40 +137,38 @@ uint16_t readSoilMillivolts() {
     while (j >= 0 && buf[j] > k) { buf[j+1] = buf[j]; j--; }
     buf[j+1] = k;
   }
-  return buf[SOIL_SAMPLES / 2]; 
+  return buf[SOIL_SAMPLES / 2];
 }
 float mvToPercent(uint16_t mv) {
   int32_t dry = cfg.soilDryMv;
   int32_t wet = cfg.soilWetMv;
-  if (dry == wet) return NAN;                  
+  if (dry == wet) return NAN;
   float pct = (float)(dry - (int32_t)mv) * 100.0f / (float)(dry - wet);
   if (pct < 0)   pct = 0;
   if (pct > 100) pct = 100;
   return pct;
 }
-
 void sampleAll() {
   r.soilMv  = readSoilMillivolts();
   r.soilPct = mvToPercent(r.soilMv);
+  r.tempC  = NAN;
+  r.humPct = NAN;
+  r.lux    = NAN;
   if (sht31OK && i2cLock()) {
     float t = sht31.readTemperature();
     float h = sht31.readHumidity();
-    r.tempC = isnan(t) ? NAN : t;
-    r.humPct = isnan(h) ? NAN : h;
+    if (!isnan(t)) r.tempC  = t;
+    if (!isnan(h)) r.humPct = h;
     i2cUnlock();
-  } else {
-    r.tempC = NAN;
-    r.humPct = NAN;
   }
   if (bh1750OK && i2cLock()) {
     float l = bh1750.readLightLevel();
-    r.lux = (isnan(l) || l < 0) ? NAN : l;
+    if (!isnan(l) && l >= 0) r.lux = l;
     i2cUnlock();
-  } else {
-    r.lux = NAN;
   }
   r.lastMs = millis();
   r.valid  = !isnan(r.soilPct);
+  applyRelay();
 }
 void loadSettings() {
   prefs.begin("plant", true);
@@ -134,6 +187,12 @@ void loadSettings() {
   cfg.luxLow       = prefs.getUShort("lLow", 200);
   cfg.luxHigh      = prefs.getUShort("lHigh", 20000);
   cfg.sampleMs     = prefs.getUShort("sMs", SAMPLE_INTERVAL_MS);
+  cfg.relayMode    = prefs.getUChar ("rlyMode", RELAY_MODE_OFF);
+  cfg.relayInvert  = prefs.getBool  ("rlyInv", false);
+  cfg.relayUseSoil = prefs.getBool  ("rlySoil", true);
+  cfg.relayUseTemp = prefs.getBool  ("rlyTemp", false);
+  cfg.relayUseHum  = prefs.getBool  ("rlyHum",  false);
+  cfg.relayUseLux  = prefs.getBool  ("rlyLux",  false);
   prefs.end();
   if (cfg.sampleMs < 500)   cfg.sampleMs = 500;
   if (cfg.sampleMs > 60000) cfg.sampleMs = 60000;
@@ -163,9 +222,11 @@ void loadSettings() {
     if (cfg.luxLow >= 65535) cfg.luxLow = 65534;
     cfg.luxHigh = (uint16_t)(cfg.luxLow + 1);
   }
+  if (cfg.relayMode > RELAY_MODE_OFF_MAN) cfg.relayMode = RELAY_MODE_OFF;
   if (strlen(cfg.ap_ssid) == 0) {
     snprintf(cfg.ap_ssid, sizeof(cfg.ap_ssid), "%s-%04X",
-             AP_SSID_PREFIX, (uint16_t)(ESP.getEfuseMac() & 0xFFFF));
+             AP_SSID_PREFIX, (unsigned)(ESP.getEfuseMac() & 0xFFFF));
+    cfg.ap_ssid[sizeof(cfg.ap_ssid) - 1] = '\0';
   }
 }
 void saveSettings() {
@@ -185,6 +246,12 @@ void saveSettings() {
   prefs.putUShort("lLow",  cfg.luxLow);
   prefs.putUShort("lHigh", cfg.luxHigh);
   prefs.putUShort("sMs",   cfg.sampleMs);
+  prefs.putUChar ("rlyMode", cfg.relayMode);
+  prefs.putBool  ("rlyInv",  cfg.relayInvert);
+  prefs.putBool  ("rlySoil", cfg.relayUseSoil);
+  prefs.putBool  ("rlyTemp", cfg.relayUseTemp);
+  prefs.putBool  ("rlyHum",  cfg.relayUseHum);
+  prefs.putBool  ("rlyLux",  cfg.relayUseLux);
   prefs.end();
 }
 
@@ -245,6 +312,35 @@ const char PAGE_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
    <div><label>Sample interval (ms)</label><input name="sampleMs" type="number" min="500" max="60000"></div>
   </div>
 
+  <label>Relay mode</label>
+  <select name="relayMode">
+   <option value="0">Off</option>
+   <option value="1">Auto (sensor thresholds)</option>
+   <option value="2">Manual ON</option>
+   <option value="3">Manual OFF</option>
+  </select>
+  <label style="display:flex;align-items:center;gap:8px;margin-top:10px">
+   <input type="checkbox" name="relayInvert" value="1" style="width:auto">
+   Invert output (for active-HIGH relay modules)
+  </label>
+  <label>Auto-mode sources (used when Relay mode = Auto)</label>
+  <label style="display:flex;align-items:center;gap:8px;margin-top:6px">
+   <input type="checkbox" name="relayUseSoil" value="1" style="width:auto">
+   Soil moisture (below low → ON, above high → OFF)
+  </label>
+  <label style="display:flex;align-items:center;gap:8px;margin-top:6px">
+   <input type="checkbox" name="relayUseTemp" value="1" style="width:auto">
+   Temperature
+  </label>
+  <label style="display:flex;align-items:center;gap:8px;margin-top:6px">
+   <input type="checkbox" name="relayUseHum" value="1" style="width:auto">
+   Humidity
+  </label>
+  <label style="display:flex;align-items:center;gap:8px;margin-top:6px">
+   <input type="checkbox" name="relayUseLux" value="1" style="width:auto">
+   Light
+  </label>
+
   <label>WiFi SSID (leave blank for AP-only mode)</label>
   <input name="sta_ssid" maxlength="32">
   <label>WiFi Password</label>
@@ -262,7 +358,7 @@ const char PAGE_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
 </div>
 
 <script>
-const fields=["soilDry","soilWet","moistureLow","moistureHigh","tempLow","tempHigh","humLow","humHigh","luxLow","luxHigh","sampleMs","sta_ssid","ap_ssid"];
+const fields=["soilDry","soilWet","moistureLow","moistureHigh","tempLow","tempHigh","humLow","humHigh","luxLow","luxHigh","sampleMs","relayMode","sta_ssid","ap_ssid"];
 function cls(v,lo,hi,inv){
   if(v===null||v===undefined||isNaN(v))return "na";
   if(lo!==null&&v<lo)return inv?"warn":"bad";
@@ -273,6 +369,7 @@ function card(lbl,val,sub,c){
   return `<div class="card"><div class="lbl">${lbl}</div><div class="val ${c}">${val}</div><div class="lbl">${sub||''}</div></div>`;
 }
 function render(d){
+  if(!d || !d.cfg || !d.readings || !d.status) return;
   const c=d.cfg, m=d.readings, st=d.status;
   const cards=[];
   cards.push(card("Soil moisture",
@@ -287,6 +384,16 @@ function render(d){
   cards.push(card("Light",
      m.lux==null?"—":m.lux.toFixed(0)+" lx",
      st.bh1750, cls(m.lux,c.luxLow,c.luxHigh,false)));
+  var srcList=[];
+  if(c.relayUseSoil) srcList.push("Soil");
+  if(c.relayUseTemp) srcList.push("Temp");
+  if(c.relayUseHum)  srcList.push("Hum");
+  if(c.relayUseLux)  srcList.push("Lux");
+  var srcTxt = (st.relayMode==="Auto") ? (srcList.length?srcList.join(", "):"no sources") : st.relayMode;
+  cards.push(card("Relay",
+     st.relayOn?"ON":"OFF",
+     srcTxt,
+     st.relayOn?"warn":"na"));
   document.getElementById("cards").innerHTML=cards.join("");
 }
 function fill(c){
@@ -294,12 +401,27 @@ function fill(c){
     const el=document.querySelector(`[name="${f}"]`);
     if(!el)continue;
     if(document.activeElement===el)continue;
-    if(c[f]!==undefined)el.value=c[f];
+    if(c[f]===undefined||c[f]===null)continue;
+    el.value = (typeof c[f] === "boolean") ? (c[f] ? "1" : "0") : c[f];
   }
+  const inv=document.querySelector(`[name="relayInvert"]`);
+  if(inv && document.activeElement!==inv) inv.checked=!!c.relayInvert;
+  const us=document.querySelector(`[name="relayUseSoil"]`);
+  if(us && document.activeElement!==us) us.checked=!!c.relayUseSoil;
+  const ut=document.querySelector(`[name="relayUseTemp"]`);
+  if(ut && document.activeElement!==ut) ut.checked=!!c.relayUseTemp;
+  const uh=document.querySelector(`[name="relayUseHum"]`);
+  if(uh && document.activeElement!==uh) uh.checked=!!c.relayUseHum;
+  const ul=document.querySelector(`[name="relayUseLux"]`);
+  if(ul && document.activeElement!==ul) ul.checked=!!c.relayUseLux;
 }
 async function poll(){
   try{
-    const j=await (await fetch('/api')).json();
+    const ctrl = new AbortController();
+    const to = setTimeout(()=>ctrl.abort(), 1500);
+    const r = await fetch('/api', {signal: ctrl.signal, cache: 'no-store'});
+    clearTimeout(to);
+    const j = await r.json();
     render(j); fill(j.cfg);
   }catch(e){}
   setTimeout(poll,2000);
@@ -315,6 +437,11 @@ document.getElementById("cfg").addEventListener("submit",async e=>{
   e.preventDefault();
   const fd=new FormData(e.target), o={};
   fd.forEach((v,k)=>o[k]=v);
+  o.relayInvert  = document.querySelector(`[name="relayInvert"]`).checked  ? "1" : "0";
+  o.relayUseSoil = document.querySelector(`[name="relayUseSoil"]`).checked ? "1" : "0";
+  o.relayUseTemp = document.querySelector(`[name="relayUseTemp"]`).checked ? "1" : "0";
+  o.relayUseHum  = document.querySelector(`[name="relayUseHum"]`).checked  ? "1" : "0";
+  o.relayUseLux  = document.querySelector(`[name="relayUseLux"]`).checked  ? "1" : "0";
   try{
     await fetch('/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o)});
     alert("Saved. Rebooting…");
@@ -326,7 +453,7 @@ poll();
 </script></body></html>)HTML";
 
 void sendJson() {
-  StaticJsonDocument<1024> doc;
+  StaticJsonDocument<2048> doc;
   JsonObject cfgO = doc.createNestedObject("cfg");
   cfgO["soilDry"]      = cfg.soilDryMv;
   cfgO["soilWet"]      = cfg.soilWetMv;
@@ -339,6 +466,12 @@ void sendJson() {
   cfgO["luxLow"]       = cfg.luxLow;
   cfgO["luxHigh"]      = cfg.luxHigh;
   cfgO["sampleMs"]     = cfg.sampleMs;
+  cfgO["relayMode"]    = cfg.relayMode;
+  cfgO["relayInvert"]  = cfg.relayInvert;
+  cfgO["relayUseSoil"] = cfg.relayUseSoil;
+  cfgO["relayUseTemp"] = cfg.relayUseTemp;
+  cfgO["relayUseHum"]  = cfg.relayUseHum;
+  cfgO["relayUseLux"]  = cfg.relayUseLux;
   cfgO["sta_ssid"]     = cfg.sta_ssid;
   cfgO["ap_ssid"]      = cfg.ap_ssid;
   JsonObject ro = doc.createNestedObject("readings");
@@ -350,50 +483,60 @@ void sendJson() {
   JsonObject so = doc.createNestedObject("status");
   so["sht31"]  = sht31OK  ? "OK" : "not found";
   so["bh1750"] = bh1750OK ? "OK" : "not found";
-  so["soil"]   = r.valid  ? "OK" : "uncalibrated";
+  const char* soilStatus;
+  if (!r.valid)                              soilStatus = "uncalibrated";
+  else if (r.soilMv < 30 || r.soilMv > 3270) soilStatus = "check probe";
+  else                                       soilStatus = "OK";
+  so["soil"] = soilStatus;
+  so["relayOn"] = r.relayState;
+  const char* rm = "Off";
+  if (cfg.relayMode == RELAY_MODE_AUTO)         rm = "Auto";
+  else if (cfg.relayMode == RELAY_MODE_ON)      rm = "Manual ON";
+  else if (cfg.relayMode == RELAY_MODE_OFF_MAN) rm = "Manual OFF";
+  so["relayMode"] = rm;
   String out; serializeJson(doc, out);
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  server.sendHeader("Pragma", "no-cache");
   server.send(200, "application/json", out);
 }
 void handleRoot() { server.send_P(200, "text/html", PAGE_HTML); }
 void handleCaptiveRedirect() {
+  if (!apModeActive) { server.send(404, "text/plain", "not found"); return; }
   String url = "http://" + WiFi.softAPIP().toString() + "/";
   server.sendHeader("Location", url, true);
   server.send(302, "text/plain", "");
 }
-void handleGenerate204() {
-  String url = "http://" + WiFi.softAPIP().toString() + "/";
-  server.sendHeader("Location", url, true);
-  server.send(302, "text/plain", "");
-}
-void handleAppleProbe() {
-  String url = "http://" + WiFi.softAPIP().toString() + "/";
-  server.sendHeader("Location", url, true);
-  server.send(302, "text/plain", "");
-}
-void handleWindowsProbe() {
+void handleCaptiveProbe() {
+  if (!apModeActive) { server.send(404, "text/plain", "not found"); return; }
   String url = "http://" + WiFi.softAPIP().toString() + "/";
   server.sendHeader("Location", url, true);
   server.send(302, "text/plain", "");
 }
 void handleSave() {
   if (!server.hasArg("plain")) { server.send(400, "text/plain", "no body"); return; }
-  StaticJsonDocument<1024> doc;
+  StaticJsonDocument<2048> doc;
   DeserializationError err = deserializeJson(doc, server.arg("plain"));
   if (err) { server.send(400, "text/plain", "bad json"); return; }
+  auto isEmptyStr = [&](const char* k)->bool {
+    if (!doc.containsKey(k))         return true;
+    if (doc[k].isNull())             return true;
+    if (!doc[k].is<const char*>())   return false;
+    return strlen(doc[k].as<const char*>()) == 0;
+  };
   auto setSoil = [&](const char* k, uint16_t &v){
-    if (doc.containsKey(k)) {
+    if (doc.containsKey(k) && !isEmptyStr(k)) {
       long x = doc[k].as<long>();
       v = (uint16_t)constrain(x, 100, 3300);
     }
   };
   auto setLux = [&](const char* k, uint16_t &v){
-    if (doc.containsKey(k)) {
+    if (doc.containsKey(k) && !isEmptyStr(k)) {
       long x = doc[k].as<long>();
       v = (uint16_t)constrain(x, 0, 65535);
     }
   };
   auto setPct = [&](const char* k, int8_t &v){
-    if (doc.containsKey(k)) {
+    if (doc.containsKey(k) && !isEmptyStr(k)) {
       long x = doc[k].as<long>();
       v = (int8_t)constrain(x, 0, 100);
     }
@@ -408,11 +551,19 @@ void handleSave() {
     }
   };
   auto setS = [&](const char* k, char* dst, size_t n, bool skipEmpty){
-    if (doc.containsKey(k)) {
+    if (!doc.containsKey(k))        return;
+    if (doc[k].isNull())            return;
+    if (!doc[k].is<const char*>())  {
       String s = doc[k].as<String>();
       if (skipEmpty && s.length() == 0) return;
       s.toCharArray(dst, n);
+      return;
     }
+    const char* s = doc[k].as<const char*>();
+    if (skipEmpty && (s == nullptr || s[0] == '\0')) return;
+    if (s == nullptr) s = "";
+    strncpy(dst, s, n - 1);
+    dst[n - 1] = '\0';
   };
   setSoil("soilDry", cfg.soilDryMv);
   setSoil("soilWet", cfg.soilWetMv);
@@ -427,6 +578,30 @@ void handleSave() {
   if (doc.containsKey("sampleMs")) {
     long x = doc["sampleMs"].as<long>();
     cfg.sampleMs = (uint16_t)constrain(x, 500, 60000);
+  }
+  if (doc.containsKey("relayMode")) {
+    long x = doc["relayMode"].as<long>();
+    cfg.relayMode = (uint8_t)constrain(x, 0, 3);
+  }
+  if (doc.containsKey("relayInvert")) {
+    String s = doc["relayInvert"].as<String>();
+    cfg.relayInvert = (s == "1" || s == "true" || s == "on");
+  }
+  if (doc.containsKey("relayUseSoil")) {
+    String s = doc["relayUseSoil"].as<String>();
+    cfg.relayUseSoil = (s == "1" || s == "true" || s == "on");
+  }
+  if (doc.containsKey("relayUseTemp")) {
+    String s = doc["relayUseTemp"].as<String>();
+    cfg.relayUseTemp = (s == "1" || s == "true" || s == "on");
+  }
+  if (doc.containsKey("relayUseHum")) {
+    String s = doc["relayUseHum"].as<String>();
+    cfg.relayUseHum = (s == "1" || s == "true" || s == "on");
+  }
+  if (doc.containsKey("relayUseLux")) {
+    String s = doc["relayUseLux"].as<String>();
+    cfg.relayUseLux = (s == "1" || s == "true" || s == "on");
   }
   setS("sta_ssid", cfg.sta_ssid, sizeof(cfg.sta_ssid), false);
   setS("sta_pass", cfg.sta_pass, sizeof(cfg.sta_pass), true);
@@ -444,9 +619,21 @@ void handleSave() {
     if (cfg.moistureLow >= 100) cfg.moistureLow = 99;
     cfg.moistureHigh = (int8_t)(cfg.moistureLow + 1);
   }
+  if (isnan(cfg.tempLow)  || isinf(cfg.tempLow))  cfg.tempLow  = 15.0f;
+  if (isnan(cfg.tempHigh) || isinf(cfg.tempHigh)) cfg.tempHigh = 30.0f;
+  if (isnan(cfg.humLow)   || isinf(cfg.humLow))   cfg.humLow   = 30.0f;
+  if (isnan(cfg.humHigh)  || isinf(cfg.humHigh))  cfg.humHigh  = 70.0f;
+  if (cfg.tempLow >= cfg.tempHigh) cfg.tempHigh = cfg.tempLow + 1;
+  if (cfg.humLow  >= cfg.humHigh)  cfg.humHigh  = cfg.humLow  + 1;
+  if (cfg.luxLow >= cfg.luxHigh) {
+    if (cfg.luxLow >= 65535) cfg.luxLow = 65534;
+    cfg.luxHigh = (uint16_t)(cfg.luxLow + 1);
+  }
   saveSettings();
+  server.sendHeader("Connection", "close");
   server.send(200, "text/plain", "ok");
-  delay(300);
+  server.client().flush();
+  delay(500);
   ESP.restart();
 }
 void performFactoryReset() {
@@ -457,8 +644,10 @@ void performFactoryReset() {
   ESP.restart();
 }
 void handleReset() {
+  server.sendHeader("Connection", "close");
   server.send(200, "text/plain", "ok");
-  delay(300);
+  server.client().flush();
+  delay(500);
   performFactoryReset();
 }
 void checkBootButton() {
@@ -468,20 +657,20 @@ void checkBootButton() {
     return;
   }
   if (pressed) {
-    if (bootBtnPressedAt == 0) {
+    if (!bootBtnActive) {
+      bootBtnActive = true;
       bootBtnPressedAt = millis();
-    } else if (millis() - bootBtnPressedAt >= BOOT_BTN_HOLD_MS) {
+    } else if ((unsigned long)(millis() - bootBtnPressedAt) >= BOOT_BTN_HOLD_MS) {
       delay(50);
       performFactoryReset();
     }
   } else {
-    if (bootBtnPressedAt != 0) {
-      bootBtnPressedAt = 0;
-    }
+    bootBtnActive = false;
   }
 }
 void startNetwork() {
   WiFi.persistent(false);
+  WiFi.setSleep(false);
   WiFi.mode(WIFI_STA);
   if (strlen(cfg.sta_ssid) > 0) {
     WiFi.begin(cfg.sta_ssid, cfg.sta_pass);
@@ -495,46 +684,61 @@ void startNetwork() {
   WiFi.mode(WIFI_AP);
   if (strlen(cfg.ap_ssid) == 0) {
     snprintf(cfg.ap_ssid, sizeof(cfg.ap_ssid), "%s-%04X",
-             AP_SSID_PREFIX, (uint16_t)(ESP.getEfuseMac() & 0xFFFF));
+             AP_SSID_PREFIX, (unsigned)(ESP.getEfuseMac() & 0xFFFF));
+    cfg.ap_ssid[sizeof(cfg.ap_ssid) - 1] = '\0';
   }
+  bool apStarted = false;
   if (strlen(cfg.ap_pass) >= 8)
-    WiFi.softAP(cfg.ap_ssid, cfg.ap_pass);
+    apStarted = WiFi.softAP(cfg.ap_ssid, cfg.ap_pass);
   else
-    WiFi.softAP(cfg.ap_ssid);
-  apModeActive = true;
-  dnsServer.start(53, "*", WiFi.softAPIP());
+    apStarted = WiFi.softAP(cfg.ap_ssid);
+
+  apModeActive = apStarted;
+  if (apModeActive) {
+    dnsServer.start(53, "*", WiFi.softAPIP());
+  }
 }
 void setup() {
+  Serial.begin(115200);
   delay(300);
   i2cMutex = xSemaphoreCreateMutex();
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW);
   pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
   analogSetPinAttenuation(SOIL_PIN, ADC_11db);
   loadSettings();
+  digitalWrite(RELAY_PIN, cfg.relayInvert ? LOW : HIGH);
+  setRelayOutput(cfg.relayMode == RELAY_MODE_ON);
   Wire.begin(I2C_SDA, I2C_SCL, I2C_FREQ);
   Wire.setTimeOut(50);
-  if (sht31.begin(0x44) && !isnan(sht31.readTemperature())) {
-    sht31OK = true;
-  } else if (sht31.begin(0x45) && !isnan(sht31.readTemperature())) {
-    sht31OK = true;
-  } else {
+  if (sht31.begin(0x44)) {
+    delay(20);
+    if (!isnan(sht31.readTemperature())) {
+      sht31OK = true;
+    }
+  }
+  if (!sht31OK && sht31.begin(0x45)) {
+    delay(20);
+    if (!isnan(sht31.readTemperature())) {
+      sht31OK = true;
+    }
   }
   if (bh1750.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x23, &Wire)) {
     bh1750OK = true;
   } else if (bh1750.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x5C, &Wire)) {
     bh1750OK = true;
-  } else {
   }
   startNetwork();
   server.on("/",       HTTP_GET,  handleRoot);
   server.on("/api",    HTTP_GET,  sendJson);
   server.on("/save",   HTTP_POST, handleSave);
   server.on("/reset",  HTTP_POST, handleReset);
-  server.on("/generate_204",        HTTP_GET, handleGenerate204);
-  server.on("/gen_204",             HTTP_GET, handleGenerate204);
-  server.on("/hotspot-detect.html", HTTP_GET, handleAppleProbe);
-  server.on("/library/test/success.html", HTTP_GET, handleAppleProbe);
-  server.on("/connecttest.txt",     HTTP_GET, handleWindowsProbe);
-  server.on("/ncsi.txt",            HTTP_GET, handleWindowsProbe);
+  server.on("/generate_204",        HTTP_GET, handleCaptiveProbe);
+  server.on("/gen_204",             HTTP_GET, handleCaptiveProbe);
+  server.on("/hotspot-detect.html", HTTP_GET, handleCaptiveProbe);
+  server.on("/library/test/success.html", HTTP_GET, handleCaptiveProbe);
+  server.on("/connecttest.txt",     HTTP_GET, handleCaptiveProbe);
+  server.on("/ncsi.txt",            HTTP_GET, handleCaptiveProbe);
   server.on("/redirect",            HTTP_GET, handleCaptiveRedirect);
   server.on("/canonical.html",      HTTP_GET, handleCaptiveRedirect);
   server.on("/success.txt",         HTTP_GET, handleCaptiveRedirect);
@@ -548,12 +752,22 @@ void setup() {
     }
   });
   server.begin();
-  sampleAll(); 
+  sampleAll();
 }
 void loop() {
   server.handleClient();
   if (apModeActive) dnsServer.processNextRequest();
   checkBootButton();
+
+  if (!apModeActive && strlen(cfg.sta_ssid) > 0 && WiFi.status() != WL_CONNECTED) {
+    static unsigned long lastReconnectTry = 0;
+    unsigned long nowRc = millis();
+    if (nowRc - lastReconnectTry >= 30000UL) {
+      lastReconnectTry = nowRc;
+      WiFi.disconnect();
+      WiFi.begin(cfg.sta_ssid, cfg.sta_pass);
+    }
+  }
   unsigned long now = millis();
   if (now - lastSample >= cfg.sampleMs) {
     lastSample = now;
