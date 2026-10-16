@@ -1,9 +1,12 @@
 /*
 *******************************************************
  * ESP32 Plant Monitor
+ * Author: Raff Alds
+ * Github: github.com/xiv3r
  * Sensors: Capacitive Soil v2.0 + SHT31 + BH1750
- * Features: Web dashboard, settings, calibration, NVS persistence, captive portal, relay control
-********************************************************
+ * Features: Web dashboard, settings, calibration
+ * NVS persistence, captive portal, relay control
+*******************************************************
 */
 
 #include <WiFi.h>
@@ -30,6 +33,7 @@
 #define RELAY_MODE_AUTO     1
 #define RELAY_MODE_ON       2
 #define RELAY_MODE_OFF_MAN  3
+#define NVS_SCHEMA_VERSION  1
 
 // ---------- Globals ----------
 WebServer server(80);
@@ -55,6 +59,8 @@ struct Settings {
   uint16_t luxLow     = 200;
   uint16_t luxHigh    = 20000;
   uint16_t sampleMs   = SAMPLE_INTERVAL_MS;
+  uint32_t relayMinOnMs  = 30000;
+  uint32_t relayMinOffMs = 30000;
   uint8_t  relayMode  = RELAY_MODE_OFF;
   bool     relayInvert = false;
   bool     relayUseSoil = true;
@@ -102,7 +108,8 @@ void applyRelay() {
   } else if (cfg.relayMode == RELAY_MODE_AUTO) {
     bool wantOn = false;
     bool wantOff = false;
-    if (cfg.relayUseSoil && r.valid && !isnan(r.soilPct)) {
+    if (cfg.relayUseSoil && r.valid && !isnan(r.soilPct) &&
+        r.soilMv >= 30 && r.soilMv <= 3270) {
       if (r.soilPct < cfg.moistureLow)  wantOn = true;
       if (r.soilPct > cfg.moistureHigh) wantOff = true;
     }
@@ -123,6 +130,22 @@ void applyRelay() {
     else on = r.relayState;
   } else {
     on = false;
+  }
+  static unsigned long lastRelayChange = 0;
+  static bool lastAppliedState = false;
+  static bool dwellInitialized = false;
+  if (!dwellInitialized) {
+    lastAppliedState = r.relayState;
+    lastRelayChange = millis();
+    dwellInitialized = true;
+  }
+  if (on != lastAppliedState) {
+    unsigned long minDwell = on ? cfg.relayMinOnMs : cfg.relayMinOffMs;
+    if (minDwell > 0 && (millis() - lastRelayChange) < minDwell) {
+      return;
+    }
+    lastRelayChange = millis();
+    lastAppliedState = on;
   }
   setRelayOutput(on);
 }
@@ -172,6 +195,8 @@ void sampleAll() {
 }
 void loadSettings() {
   prefs.begin("plant", true);
+  uint8_t storedVersion = prefs.getUChar("schema", 0);
+  (void)storedVersion;
   prefs.getString("sta_ssid", "").toCharArray(cfg.sta_ssid, sizeof(cfg.sta_ssid));
   prefs.getString("sta_pass", "").toCharArray(cfg.sta_pass, sizeof(cfg.sta_pass));
   prefs.getString("ap_ssid",  "").toCharArray(cfg.ap_ssid,  sizeof(cfg.ap_ssid));
@@ -187,6 +212,8 @@ void loadSettings() {
   cfg.luxLow       = prefs.getUShort("lLow", 200);
   cfg.luxHigh      = prefs.getUShort("lHigh", 20000);
   cfg.sampleMs     = prefs.getUShort("sMs", SAMPLE_INTERVAL_MS);
+  cfg.relayMinOnMs  = prefs.getUInt("rlyMinOn",  30000);
+  cfg.relayMinOffMs = prefs.getUInt("rlyMinOff", 30000);
   cfg.relayMode    = prefs.getUChar ("rlyMode", RELAY_MODE_OFF);
   cfg.relayInvert  = prefs.getBool  ("rlyInv", false);
   cfg.relayUseSoil = prefs.getBool  ("rlySoil", true);
@@ -196,6 +223,8 @@ void loadSettings() {
   prefs.end();
   if (cfg.sampleMs < 500)   cfg.sampleMs = 500;
   if (cfg.sampleMs > 60000) cfg.sampleMs = 60000;
+  if (cfg.relayMinOnMs  > 86400000UL) cfg.relayMinOnMs  = 0;
+  if (cfg.relayMinOffMs > 86400000UL) cfg.relayMinOffMs = 0;
   if (cfg.soilDryMv < 100 || cfg.soilDryMv > 3300) cfg.soilDryMv = 2500;
   if (cfg.soilWetMv < 100 || cfg.soilWetMv > 3300) cfg.soilWetMv = 1200;
   if (cfg.soilDryMv <= cfg.soilWetMv + 50) {
@@ -216,6 +245,14 @@ void loadSettings() {
   if (isnan(cfg.tempHigh) || isinf(cfg.tempHigh)) cfg.tempHigh = 30.0f;
   if (isnan(cfg.humLow)   || isinf(cfg.humLow))   cfg.humLow   = 30.0f;
   if (isnan(cfg.humHigh)  || isinf(cfg.humHigh))  cfg.humHigh  = 70.0f;
+  if (cfg.tempLow  < -50.0f)  cfg.tempLow  = -50.0f;
+  if (cfg.tempLow  >  150.0f) cfg.tempLow  =  150.0f;
+  if (cfg.tempHigh < -50.0f)  cfg.tempHigh = -50.0f;
+  if (cfg.tempHigh >  150.0f) cfg.tempHigh =  150.0f;
+  if (cfg.humLow   <  0.0f)   cfg.humLow   =  0.0f;
+  if (cfg.humLow   >  100.0f) cfg.humLow   =  100.0f;
+  if (cfg.humHigh  <  0.0f)   cfg.humHigh  =  0.0f;
+  if (cfg.humHigh  >  100.0f) cfg.humHigh  =  100.0f;
   if (cfg.tempLow >= cfg.tempHigh) cfg.tempHigh = cfg.tempLow + 1;
   if (cfg.humLow  >= cfg.humHigh)  cfg.humHigh  = cfg.humLow  + 1;
   if (cfg.luxLow >= cfg.luxHigh) {
@@ -229,8 +266,10 @@ void loadSettings() {
     cfg.ap_ssid[sizeof(cfg.ap_ssid) - 1] = '\0';
   }
 }
-void saveSettings() {
-  prefs.begin("plant", false);
+bool saveSettings() {
+  if (!prefs.begin("plant", false)) {
+    return false;
+  }
   prefs.putString("sta_ssid", cfg.sta_ssid);
   prefs.putString("sta_pass", cfg.sta_pass);
   prefs.putString("ap_ssid",  cfg.ap_ssid);
@@ -246,13 +285,17 @@ void saveSettings() {
   prefs.putUShort("lLow",  cfg.luxLow);
   prefs.putUShort("lHigh", cfg.luxHigh);
   prefs.putUShort("sMs",   cfg.sampleMs);
+  prefs.putUInt  ("rlyMinOn",  cfg.relayMinOnMs);
+  prefs.putUInt  ("rlyMinOff", cfg.relayMinOffMs);
   prefs.putUChar ("rlyMode", cfg.relayMode);
   prefs.putBool  ("rlyInv",  cfg.relayInvert);
   prefs.putBool  ("rlySoil", cfg.relayUseSoil);
   prefs.putBool  ("rlyTemp", cfg.relayUseTemp);
   prefs.putBool  ("rlyHum",  cfg.relayUseHum);
   prefs.putBool  ("rlyLux",  cfg.relayUseLux);
+  prefs.putUChar ("schema",  NVS_SCHEMA_VERSION);
   prefs.end();
+  return true;
 }
 
 // ---------- Web UI ----------
@@ -311,6 +354,10 @@ const char PAGE_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
   <div class="row">
    <div><label>Sample interval (ms)</label><input name="sampleMs" type="number" min="500" max="60000"></div>
   </div>
+  <div class="row">
+   <div><label>Relay min ON (ms, 0=off)</label><input name="relayMinOnMs" type="number" min="0" max="86400000"></div>
+   <div><label>Relay min OFF (ms, 0=off)</label><input name="relayMinOffMs" type="number" min="0" max="86400000"></div>
+  </div>
 
   <label>Relay mode</label>
   <select name="relayMode">
@@ -358,7 +405,7 @@ const char PAGE_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
 </div>
 
 <script>
-const fields=["soilDry","soilWet","moistureLow","moistureHigh","tempLow","tempHigh","humLow","humHigh","luxLow","luxHigh","sampleMs","relayMode","sta_ssid","ap_ssid"];
+const fields=["soilDry","soilWet","moistureLow","moistureHigh","tempLow","tempHigh","humLow","humHigh","luxLow","luxHigh","sampleMs","relayMinOnMs","relayMinOffMs","relayMode","sta_ssid","ap_ssid"];
 let formDirty = false;
 
 function cls(v,lo,hi,inv){
@@ -485,6 +532,8 @@ void sendJson() {
   cfgO["luxLow"]       = cfg.luxLow;
   cfgO["luxHigh"]      = cfg.luxHigh;
   cfgO["sampleMs"]     = cfg.sampleMs;
+  cfgO["relayMinOnMs"]  = cfg.relayMinOnMs;
+  cfgO["relayMinOffMs"] = cfg.relayMinOffMs;
   cfgO["relayMode"]    = cfg.relayMode;
   cfgO["relayInvert"]  = cfg.relayInvert;
   cfgO["relayUseSoil"] = cfg.relayUseSoil;
@@ -598,6 +647,16 @@ void handleSave() {
     long x = doc["sampleMs"].as<long>();
     cfg.sampleMs = (uint16_t)constrain(x, 500, 60000);
   }
+  if (doc.containsKey("relayMinOnMs")) {
+    unsigned long x = doc["relayMinOnMs"].as<unsigned long>();
+    if (x > 86400000UL) x = 0;
+    cfg.relayMinOnMs = (uint32_t)x;
+  }
+  if (doc.containsKey("relayMinOffMs")) {
+    unsigned long x = doc["relayMinOffMs"].as<unsigned long>();
+    if (x > 86400000UL) x = 0;
+    cfg.relayMinOffMs = (uint32_t)x;
+  }
   if (doc.containsKey("relayMode")) {
     long x = doc["relayMode"].as<long>();
     cfg.relayMode = (uint8_t)constrain(x, 0, 3);
@@ -642,13 +701,24 @@ void handleSave() {
   if (isnan(cfg.tempHigh) || isinf(cfg.tempHigh)) cfg.tempHigh = 30.0f;
   if (isnan(cfg.humLow)   || isinf(cfg.humLow))   cfg.humLow   = 30.0f;
   if (isnan(cfg.humHigh)  || isinf(cfg.humHigh))  cfg.humHigh  = 70.0f;
+  if (cfg.tempLow  < -50.0f)  cfg.tempLow  = -50.0f;
+  if (cfg.tempLow  >  150.0f) cfg.tempLow  =  150.0f;
+  if (cfg.tempHigh < -50.0f)  cfg.tempHigh = -50.0f;
+  if (cfg.tempHigh >  150.0f) cfg.tempHigh =  150.0f;
+  if (cfg.humLow   <  0.0f)   cfg.humLow   =  0.0f;
+  if (cfg.humLow   >  100.0f) cfg.humLow   =  100.0f;
+  if (cfg.humHigh  <  0.0f)   cfg.humHigh  =  0.0f;
+  if (cfg.humHigh  >  100.0f) cfg.humHigh  =  100.0f;
   if (cfg.tempLow >= cfg.tempHigh) cfg.tempHigh = cfg.tempLow + 1;
   if (cfg.humLow  >= cfg.humHigh)  cfg.humHigh  = cfg.humLow  + 1;
   if (cfg.luxLow >= cfg.luxHigh) {
     if (cfg.luxLow >= 65535) cfg.luxLow = 65534;
     cfg.luxHigh = (uint16_t)(cfg.luxLow + 1);
   }
-  saveSettings();
+  if (!saveSettings()) {
+    server.send(500, "text/plain", "nvs error");
+    return;
+  }
   server.sendHeader("Connection", "close");
   server.send(200, "text/plain", "ok");
   server.client().flush();
@@ -722,7 +792,6 @@ void setup() {
   delay(300);
   i2cMutex = xSemaphoreCreateMutex();
   pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, LOW);
   pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
   analogSetPinAttenuation(SOIL_PIN, ADC_11db);
   loadSettings();
@@ -783,7 +852,9 @@ void loop() {
     unsigned long nowRc = millis();
     if (nowRc - lastReconnectTry >= 30000UL) {
       lastReconnectTry = nowRc;
-      WiFi.disconnect();
+      WiFi.disconnect(true, false);
+      delay(100);
+      WiFi.mode(WIFI_STA);
       WiFi.begin(cfg.sta_ssid, cfg.sta_pass);
     }
   }
@@ -791,5 +862,22 @@ void loop() {
   if (now - lastSample >= cfg.sampleMs) {
     lastSample = now;
     sampleAll();
+  }
+
+  static unsigned long lastHeapCheck = 0;
+  if (now - lastHeapCheck >= 60000UL) {
+    lastHeapCheck = now;
+    uint32_t freeHeap = ESP.getFreeHeap();
+    if (freeHeap < 30000) {
+      delay(100);
+      ESP.restart();
+    }
+  }
+
+  static unsigned long bootMillis = 0;
+  if (bootMillis == 0) bootMillis = millis();
+  if (now - bootMillis >= 6UL * 24UL * 3600UL * 1000UL) {
+    delay(100);
+    ESP.restart();
   }
 }
