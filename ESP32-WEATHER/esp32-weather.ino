@@ -6,7 +6,6 @@
 ===================================================================
 */
 
-
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
@@ -126,8 +125,6 @@ bool jsonArrayCount(const String& body, const String& key, int& out);
 
 // ---------------- SETUP ----------------
 void setup() {
-  Serial.begin(115200); delay(150);
-  Serial.println(); Serial.println(F("=== ESP32 Firmware v3.2.0 ==="));
   pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
   loadConfig();
   bootMs = millis();
@@ -217,14 +214,12 @@ void startAP() {
   IPAddress ip(192,168,4,1), gw(192,168,4,1), mk(255,255,255,0);
   WiFi.softAPConfig(ip, gw, mk);
   apActive = WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, AP_HIDDEN, AP_MAX_CONN);
-  if (apActive) Serial.printf("[AP] %s @ %s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
 }
 
 void startSTA() {
   WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
   unsigned long s = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - s < 15000) { delay(200); Serial.print('.'); }
-  Serial.println();
+  while (WiFi.status() != WL_CONNECTED && millis() - s < 15000) { delay(200); }
   if (WiFi.status() == WL_CONNECTED) { staConnected = true; portalMode = false; }
   else { staConnected = false; portalMode = true; }
 }
@@ -917,11 +912,6 @@ void handleBootButton() {
       if (digitalRead(BOOT_BTN_PIN) == LOW) { btnHeld = true; btnPressStart = millis(); }
     } else {
       unsigned long held = millis() - btnPressStart;
-      static unsigned long lastLog = 0;
-      if (millis() - lastLog > 1000) {
-        lastLog = millis();
-        Serial.printf("[BTN] %lus/%lus\n", held/1000, (unsigned long)(FACTORY_HOLD_MS/1000));
-      }
       if (held >= FACTORY_HOLD_MS) {
         factoryDone = true;
         WiFi.softAPdisconnect(true);
