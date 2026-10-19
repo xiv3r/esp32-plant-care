@@ -206,6 +206,8 @@ void sanitizeSettings() {
   auto fixPair = [](float &on, float &off, float lo, float hi,
                     float gap, float step) {
     if (step <= 0) step = gap;
+    if (isnan(on))  on  = hi;
+    if (isnan(off)) off = lo;
     if (on < lo) on = lo;
     if (on > hi) on = hi;
     if (off >= on) off = on - step;
@@ -338,7 +340,11 @@ void loadSettings() {
 
 void flushSettingsToNVS() {
   sanitizeSettings();
-  prefs.begin("app", false);
+  if (!prefs.begin("app", false)) {
+    lastSaveAttemptMs = millis();
+    saveDirty         = false;
+    return;
+  }
   prefs.putString("ssid", cfg.ssid);
   prefs.putString("pass", cfg.password);
   prefs.putString("host", cfg.hostname);
@@ -1143,6 +1149,7 @@ void handleSave() {
 }
 
 void handleLocationsSave() {
+  bool coordWarn = false;
   for (uint8_t i = 0; i < locationCount; i++) {
     String prefixN = "ln" + String(i);
     String prefixA = "la" + String(i);
@@ -1156,15 +1163,19 @@ void handleLocationsSave() {
     float v;
     if (parseFloatArg(prefixA.c_str(), &v)) {
       if (v >= -90 && v <= 90) locations[i].lat = v;
+      else                     coordWarn = true;
     }
     if (parseFloatArg(prefixO.c_str(), &v)) {
       if (v >= -180 && v <= 180) locations[i].lon = v;
+      else                       coordWarn = true;
     }
     locations[i].enabled = server.hasArg(prefixE.c_str());
   }
   saveSettings();
   weatherRefreshRequested = true;
-  server.send(200, "text/html", locationsPage("✅ Locations saved. Weather refreshing..."));
+  String msg = "✅ Locations saved. Weather refreshing...";
+  if (coordWarn) msg += " ⚠️ Some coordinates were out of range and kept their previous values.";
+  server.send(200, "text/html", locationsPage(msg));
 }
 
 void handleLocationsAdd() {
@@ -1240,7 +1251,15 @@ void handleRefresh() {
   lastWeatherPoll        = millis();
   weatherRefreshRequested = false;
   bool ok = fetchWeather();
-  if (ok) resetWeatherBackoff();
+  if (ok) {
+    resetWeatherBackoff();
+  } else {
+    weatherFailCount++;
+    unsigned long nb = weatherBackoffMs * 2UL;
+    if (nb > WEATHER_FAIL_BACKOFF_MAX_MS || nb < weatherBackoffMs)
+      nb = WEATHER_FAIL_BACKOFF_MAX_MS;
+    weatherBackoffMs = nb;
+  }
   evaluateRelay();
   statusPageSend(ok ? "🔄 Weather updated." : ("⚠️ Update failed."), !ok);
 }
