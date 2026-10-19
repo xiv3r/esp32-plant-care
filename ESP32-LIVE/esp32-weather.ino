@@ -651,7 +651,6 @@ String htmlHeader(const String &title) {
   return s;
 }
 String htmlFooter() { return F("</div></body></html>"); }
-
 String cRow(const String &name, bool checked, const String &label) {
   return String("<label><input type='checkbox' name='") + name + "' value='1'"
        + (checked ? " checked" : "") + ">" + label + "</label>";
