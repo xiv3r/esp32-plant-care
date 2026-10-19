@@ -58,18 +58,14 @@ struct Location {
 
 // ---------------- Settings ----------------
 struct Settings {
-  // STA
   String ssid           = "";
   String password       = "";
   String hostname       = "esp32-weather";
-  // AP
   bool   apEnabled      = true;
   String apSsid         = "";
   String apPassword     = "";
-  // Relay basics
   bool   relayEnabled   = true;
   bool   relayActiveLow = true;
-  // Trigger toggles
   bool   useTemp        = true;
   bool   useFeels       = false;
   bool   useRainMm      = false;
@@ -113,12 +109,16 @@ unsigned long lastStaRetry      = 0;
 unsigned long staBackoffMs      = STA_BACKOFF_MIN_MS;
 int           staRetries        = 0;
 unsigned long lastApAttemptMs   = 0;
+unsigned long apRetryBackoffMs  = AP_RETRY_INTERVAL_MS;
 unsigned long weatherBackoffMs  = WEATHER_POLL_MS;
 unsigned long weatherFailCount  = 0;
 bool          bootArmed         = false;
 bool          weatherRefreshRequested = false;
 bool          staManualDisable        = false;
 unsigned long lastWeatherPoll         = 0;
+unsigned long lastSaveAttemptMs       = 0;
+bool          saveDirty               = false;
+unsigned long lastEvalMs              = 0;
 
 // ---------------- Weather (per location) ----------------
 struct WeatherState {
@@ -181,7 +181,6 @@ void addDefaultLocationIfEmpty() {
     locationCount        = 1;
   }
 }
-
 int countEnabledLocations() {
   int n = 0;
   for (uint8_t i = 0; i < locationCount; i++) if (locations[i].enabled) n++;
@@ -337,7 +336,7 @@ void loadSettings() {
   sanitizeSettings();
 }
 
-void saveSettings() {
+void flushSettingsToNVS() {
   sanitizeSettings();
   prefs.begin("app", false);
   prefs.putString("ssid", cfg.ssid);
@@ -376,9 +375,18 @@ void saveSettings() {
   prefs.putChar  ("frc",  (char)cfg.forceState);
   saveLocations();
   prefs.end();
+  lastSaveAttemptMs = millis();
+  saveDirty         = false;
+}
+
+void saveSettings() {
+  saveDirty = true;
+  if (millis() - lastSaveAttemptMs < 5000UL) return;
+  flushSettingsToNVS();
 }
 
 void factoryReset() {
+  saveDirty = false;
   prefs.begin("app", false);
   prefs.clear();
   prefs.end();
@@ -396,9 +404,9 @@ void applyRelayHardware(bool on) {
 }
 
 void initRelayPin() {
-  pinMode(RELAY_PIN, OUTPUT);
   if (cfg.relayActiveLow) digitalWrite(RELAY_PIN, HIGH);
   else                    digitalWrite(RELAY_PIN, LOW);
+  pinMode(RELAY_PIN, OUTPUT);
   relayIsOn = false;
 }
 int8_t evaluateLocation(int idx) {
@@ -571,19 +579,19 @@ bool fetchWeather() {
       wx[i].lastErr = "No enabled locations";
     return false;
   }
-
   String url = "http://api.open-meteo.com/v1/forecast?latitude=";
   url += latList;
   url += "&longitude=";
   url += lonList;
   url += "&current=temperature_2m,relative_humidity_2m,apparent_temperature,"
          "weather_code,wind_speed_10m,wind_gusts_10m,precipitation&timezone=auto";
-
   HTTPClient http;
   http.setConnectTimeout(WEATHER_TIMEOUT_MS);
   http.setTimeout(WEATHER_TIMEOUT_MS);
-  if (!http.begin(url)) {
+  bool begun = http.begin(url);
+  if (!begun) {
     for (uint8_t i = 0; i < locationCount; i++) wx[i].lastErr = "begin fail";
+    http.end();
     return false;
   }
   int code = http.GET();
@@ -677,7 +685,6 @@ String htmlHeader(const String &title) {
   return s;
 }
 String htmlFooter() { return F("</div></body></html>"); }
-
 String cRow(const String &name, bool checked, const String &label) {
   return String("<label><input type='checkbox' name='") + name + "' value='1'"
        + (checked ? " checked" : "") + ">" + label + "</label>";
@@ -693,7 +700,6 @@ void statusPageSend(const String &msg = "", bool err = false) {
   server.sendContent("<h1>🌦️ Weather-Controlled Relay</h1>");
   if (msg.length())
     server.sendContent("<div class='msg" + String(err ? " err" : "") + "'>" + htmlEscape(msg) + "</div>");
-
   server.sendContent("<div class='card'><h2>Live Weather</h2>");
   if (locationCount == 0) {
     server.sendContent("<div class='row'><span>Status</span><span class='val off'>No locations configured</span></div>");
@@ -774,7 +780,9 @@ void statusPageSend(const String &msg = "", bool err = false) {
 //  LOCATIONS PAGE
 // =====================================================================
 String locationsPage(const String &msg = "", bool err = false) {
-  String s = htmlHeader("Locations");
+  String s;
+  s.reserve(12000);
+  s = htmlHeader("Locations");
   s += "<h1>📍 Locations</h1>";
   if (msg.length()) s += "<div class='msg" + String(err ? " err" : "") + "'>" + htmlEscape(msg) + "</div>";
   s += "<div class='card'><h2>Configured (" + String(locationCount) + "/" + String(MAX_LOCATIONS) + ")</h2>";
@@ -793,7 +801,6 @@ String locationsPage(const String &msg = "", bool err = false) {
     s += "<button type='submit'>💾 Save All Locations</button>";
   }
   s += "</form></div>";
-
   if (locationCount < MAX_LOCATIONS) {
     s += "<div class='card'><h2>Add Location</h2><form method='POST' action='/locations/add'>";
     s += "<label>Name</label><input name='name' maxlength='32' placeholder='e.g. Tokyo'>";
@@ -803,7 +810,6 @@ String locationsPage(const String &msg = "", bool err = false) {
          "</div>";
     s += "<button class='grn' type='submit'>➕ Add Location</button></form></div>";
   }
-
   s += "<div class='card'><h2>Delete Location</h2>";
   if (locationCount > 0) {
     s += "<form method='POST' action='/locations/del' onsubmit=\"return confirm('Delete this location?')\">";
@@ -817,14 +823,12 @@ String locationsPage(const String &msg = "", bool err = false) {
     s += "<div class='row'><span>No locations.</span></div>";
   }
   s += "</div>";
-
   s += "<div class='card'><h2>Combine Locations</h2><form method='POST' action='/locations/mode'>";
   s += "<label>Relay when</label><select name='mLAll'>"
        "<option value='0'" + String(!cfg.multiLogicAll ? " selected" : "") + ">ANY location triggers</option>"
        "<option value='1'" + String(cfg.multiLogicAll ? " selected" : "") + ">ALL locations trigger</option>"
        "</select>";
   s += "<button type='submit'>💾 Save Combine Mode</button></form></div>";
-
   s += "<a href='/'><button class='gray'>← Back</button></a>";
   s += htmlFooter();
   return s;
@@ -834,12 +838,12 @@ String locationsPage(const String &msg = "", bool err = false) {
 //  SETTINGS PAGE
 // =====================================================================
 String settingsPage(const String &msg = "", bool err = false) {
-  String s = htmlHeader("Settings");
+  String s;
+  s.reserve(12000);
+  s = htmlHeader("Settings");
   s += "<h1>⚙️ Settings</h1>";
   if (msg.length()) s += "<div class='msg" + String(err ? " err" : "") + "'>" + htmlEscape(msg) + "</div>";
-
   s += "<form method='POST' action='/save'>";
-
   s += "<div class='card'><h2>Relay Basics</h2>";
   s += "<label>Relay Enabled</label><select name='rEn'>"
        "<option value='1'" + String(cfg.relayEnabled ? " selected" : "") + ">Yes</option>"
@@ -852,7 +856,6 @@ String settingsPage(const String &msg = "", bool err = false) {
        "<option value='1'"  + String(cfg.forceState == 1  ? " selected" : "") + ">Force ON</option>"
        "<option value='-1'" + String(cfg.forceState == -1 ? " selected" : "") + ">Force OFF</option></select>";
   s += "</div>";
-
   s += "<div class='card'><h2>Trigger Logic</h2>";
   s += "<label>Combine triggers within a location</label><select name='lAll'>"
        "<option value='0'" + String(!cfg.logicAll ? " selected" : "") + ">ANY (OR)</option>"
@@ -861,56 +864,48 @@ String settingsPage(const String &msg = "", bool err = false) {
        "<option value='1'" + String(cfg.preferOn ? " selected" : "") + ">Prefer ON</option>"
        "<option value='0'" + String(!cfg.preferOn ? " selected" : "") + ">Prefer OFF</option></select>";
   s += "</div>";
-
   s += "<div class='card'><h2>Temperature Trigger</h2>";
   s += cRow("uT", cfg.useTemp, "Enable temperature trigger");
   s += "<div class='grid'>"
        "<div><label>ON at ≥ (°C)</label><input name='tOn' type='number' step='0.1' min='-40' max='60' value='" + String(cfg.tempOn, 1) + "'></div>"
        "<div><label>OFF at ≤ (°C)</label><input name='tOff' type='number' step='0.1' min='-40' max='60' value='" + String(cfg.tempOff, 1) + "'></div>"
        "</div></div>";
-
   s += "<div class='card'><h2>Feels-like Trigger</h2>";
   s += cRow("uF", cfg.useFeels, "Enable feels-like trigger");
   s += "<div class='grid'>"
        "<div><label>ON at ≥ (°C)</label><input name='fOn' type='number' step='0.1' min='-40' max='70' value='" + String(cfg.feelsOn, 1) + "'></div>"
        "<div><label>OFF at ≤ (°C)</label><input name='fOff' type='number' step='0.1' min='-40' max='70' value='" + String(cfg.feelsOff, 1) + "'></div>"
        "</div></div>";
-
   s += "<div class='card'><h2>Rain Volume Trigger (mm in last hour)</h2>";
   s += cRow("uRm", cfg.useRainMm, "Enable rain volume trigger");
   s += "<div class='grid'>"
        "<div><label>ON at ≥ (mm)</label><input name='rOn' type='number' step='0.05' min='0.1' max='100' value='" + String(cfg.rainOn, 2) + "'></div>"
        "<div><label>OFF at ≤ (mm)</label><input name='rOff' type='number' step='0.05' min='0' max='100' value='" + String(cfg.rainOff, 2) + "'></div>"
        "</div></div>";
-
   s += "<div class='card'><h2>Wind Speed Trigger</h2>";
   s += cRow("uW", cfg.useWind, "Enable wind speed trigger");
   s += "<div class='grid'>"
        "<div><label>ON at ≥ (km/h)</label><input name='wOn' type='number' step='1' min='2' max='300' value='" + String(cfg.windOn, 1) + "'></div>"
        "<div><label>OFF at ≤ (km/h)</label><input name='wOff' type='number' step='1' min='0' max='300' value='" + String(cfg.windOff, 1) + "'></div>"
        "</div></div>";
-
   s += "<div class='card'><h2>Wind Gust Trigger</h2>";
   s += cRow("uG", cfg.useGusts, "Enable gust trigger");
   s += "<div class='grid'>"
        "<div><label>ON at ≥ (km/h)</label><input name='gOn' type='number' step='1' min='2' max='400' value='" + String(cfg.gustOn, 1) + "'></div>"
        "<div><label>OFF at ≤ (km/h)</label><input name='gOff' type='number' step='1' min='0' max='400' value='" + String(cfg.gustOff, 1) + "'></div>"
        "</div></div>";
-
   s += "<div class='card'><h2>Humidity Trigger</h2>";
   s += cRow("uH", cfg.useHumidity, "Enable humidity trigger");
   s += "<div class='grid'>"
        "<div><label>ON at ≥ (%)</label><input name='hOn' type='number' step='1' min='2' max='100' value='" + String(cfg.humOn, 0) + "'></div>"
        "<div><label>OFF at ≤ (%)</label><input name='hOff' type='number' step='1' min='0' max='100' value='" + String(cfg.humOff, 0) + "'></div>"
        "</div></div>";
-
   s += "<div class='card'><h2>Weather-Code Triggers</h2>";
   s += cRow("uRc", cfg.useRainCode,  "Rain (code 51–67, 80–82)");
   s += cRow("uSc", cfg.useSnowCode,  "Snow (code 71–77, 85–86)");
   s += cRow("uSt", cfg.useStormCode, "Thunderstorm (code 95–99)");
   s += cRow("uFg", cfg.useFogCode,   "Fog (code 45, 48)");
   s += "</div>";
-
   s += "<button type='submit'>💾 Save Settings</button></form>";
   s += "<a href='/'><button class='gray'>← Back</button></a>";
   s += htmlFooter();
@@ -921,10 +916,11 @@ String settingsPage(const String &msg = "", bool err = false) {
 //  WIFI PAGE
 // =====================================================================
 String wifiPage(const String &msg = "", bool err = false) {
-  String s = htmlHeader("WiFi Manager");
+  String s;
+  s.reserve(8000);
+  s = htmlHeader("WiFi Manager");
   s += "<h1>📶 WiFi Manager</h1>";
   if (msg.length()) s += "<div class='msg" + String(err ? " err" : "") + "'>" + htmlEscape(msg) + "</div>";
-
   s += "<div class='card'><h2>Status</h2>";
   s += "<div class='row'><span>STA Mode</span><span class='val " + String(staConnected ? "on'>Connected" : "off'>Disconnected") + "</span></div>";
   if (staConnected) {
@@ -942,7 +938,6 @@ String wifiPage(const String &msg = "", bool err = false) {
     s += "<div class='row'><span>Clients</span><span class='val'>" + String(clients) + "</span></div>";
   }
   s += "</div>";
-
   s += "<div class='card'><h2>Station (Home WiFi)</h2><form method='POST' action='/wifi/sta'>";
   s += "<label>SSID</label><input name='ssid' value='" + htmlEscape(cfg.ssid) + "' maxlength='32'>";
   s += "<label>Password</label><input name='pass' type='password' value='' placeholder='leave blank to keep current' maxlength='64'>";
@@ -957,7 +952,6 @@ String wifiPage(const String &msg = "", bool err = false) {
          "<button class='grn' type='submit'>🔄 Reconnect STA</button></form>";
   }
   s += "</div>";
-
   s += "<div class='card'><h2>Access Point (Recovery)</h2><form method='POST' action='/wifi/ap'>";
   s += "<label>Enable AP</label><select name='apEn'>"
        "<option value='1'" + String(cfg.apEnabled ? " selected" : "") + ">Yes</option>"
@@ -967,25 +961,22 @@ String wifiPage(const String &msg = "", bool err = false) {
   s += "<label><input type='checkbox' name='apClr' value='1'> Clear AP password (open network)</label>";
   s += "<button type='submit'>💾 Save AP Settings</button></form>";
   s += "</div>";
-
   s += "<div class='card'><h2>Scan Nearby Networks</h2>"
        "<a href='/wifi/scan'><button class='gray'>🔍 Scan</button></a></div>";
-
   s += "<a href='/'><button class='gray'>← Back</button></a>";
   s += htmlFooter();
   return s;
 }
-
 String scanPage() {
-  String s = htmlHeader("WiFi Scan");
+  String s;
+  s.reserve(4000);
+  s = htmlHeader("WiFi Scan");
   s += "<h1>🔍 Scan Results</h1>";
-
   wifi_mode_t prev = WiFi.getMode();
   WiFi.mode(WIFI_AP_STA);
   delay(50);
   int n = WiFi.scanNetworks(false, true);
   WiFi.mode(prev);
-
   s += "<div class='card'>";
   if (n < 0) {
     s += "<div class='row'><span>Scan failed. Try again.</span></div>";
@@ -1058,12 +1049,16 @@ void startAP() {
   }
   if (!ok) {
     apMode = false;
+    unsigned long nb = apRetryBackoffMs * 2UL;
+    if (nb > 300000UL || nb < apRetryBackoffMs) nb = 300000UL;
+    apRetryBackoffMs = nb;
     return;
   }
   delay(50);
   dns.stop();
   dns.start(DNS_PORT, "*", WiFi.softAPIP());
   apMode = true;
+  apRetryBackoffMs = AP_RETRY_INTERVAL_MS;
 }
 
 // =====================================================================
@@ -1075,7 +1070,6 @@ void handleWifi()     { server.send(200, "text/html", wifiPage()); }
 void handleScan()     { server.send(200, "text/html", scanPage()); }
 void handleLocations(){ server.send(200, "text/html", locationsPage()); }
 bool argBool(const char *k) { return server.hasArg(k) && server.arg(k) == "1"; }
-
 bool parseFloatArg(const char *k, float *out) {
   if (!server.hasArg(k)) return false;
   String s = server.arg(k);
@@ -1134,10 +1128,13 @@ void handleSave() {
       if (parseFloatArg(nf.k, &v)) *nf.dst = v;
     }
   }
-  String frc = server.arg("frc");
-  if      (frc == "1")  cfg.forceState = 1;
-  else if (frc == "-1") cfg.forceState = -1;
-  else                  cfg.forceState = 0;
+  if (server.hasArg("frc")) {
+    String frc = server.arg("frc");
+    if      (frc == "1")  cfg.forceState = 1;
+    else if (frc == "-1") cfg.forceState = -1;
+    else                  cfg.forceState = 0;
+  }
+  sanitizeSettings();
   saveSettings();
   applyRelayHardware(relayIsOn);
   evaluateRelay();
@@ -1274,12 +1271,10 @@ void handleWifiStaSave() {
     pass = "";
   } else if (pass.length() == 0) {
     pass = cfg.password;
-  } else if (pass.length() < 8) {
+  } else if (pass.length() < 8 || pass.length() > 63) {
     server.send(400, "text/html",
       wifiPage("STA password must be 8–63 characters, or leave blank to keep current.", true));
     return;
-  } else if (pass.length() > 63) {
-    pass = pass.substring(0, 63);
   }
   cfg.ssid     = ssid;
   cfg.password = pass;
@@ -1287,7 +1282,7 @@ void handleWifiStaSave() {
   staManualDisable = false;
   staRetries   = 0;
   staBackoffMs = STA_BACKOFF_MIN_MS;
-  saveSettings();
+  flushSettingsToNVS();
   server.send(200, "text/html",
     F("<html><body style='font-family:system-ui;background:#0f172a;color:#e2e8f0;"
       "text-align:center;padding-top:60px'><h2>Saved.</h2>"
@@ -1330,11 +1325,10 @@ void handleWifiApSave() {
   }
   if (ss.length() > 32) ss = ss.substring(0, 32);
   if (pw.length() > 0) {
-    if (pw.length() < 8) {
+    if (pw.length() < 8 || pw.length() > 63) {
       server.send(400, "text/html", wifiPage("AP password must be 8–63 chars or blank.", true));
       return;
     }
-    if (pw.length() > 63) pw = pw.substring(0, 63);
   } else if (server.hasArg("apClr") && server.arg("apClr") == "1") {
     pw = "";
   } else {
@@ -1343,7 +1337,7 @@ void handleWifiApSave() {
   cfg.apEnabled  = apEn;
   cfg.apSsid     = ss;
   cfg.apPassword = pw;
-  saveSettings();
+  flushSettingsToNVS();
   server.send(200, "text/html",
     F("<html><body style='font-family:system-ui;background:#0f172a;color:#e2e8f0;"
       "text-align:center;padding-top:60px'><h2>AP settings saved.</h2>"
@@ -1534,11 +1528,18 @@ void setup() {
 // =====================================================================
 void loop() {
   uptimeTick();
+  if (saveDirty && (millis() - lastSaveAttemptMs >= 5000UL)) {
+    flushSettingsToNVS();
+  }
   handleBootButton();
   if (apMode) dns.processNextRequest();
   server.handleClient();
   staConnected = (WiFi.status() == WL_CONNECTED);
-  if (!apMode && cfg.apEnabled && (millis() - lastApAttemptMs >= AP_RETRY_INTERVAL_MS)) {
+  if (millis() - lastEvalMs >= 5000UL) {
+    lastEvalMs = millis();
+    evaluateRelay();
+  }
+  if (!apMode && cfg.apEnabled && (millis() - lastApAttemptMs >= apRetryBackoffMs)) {
     lastApAttemptMs = millis();
     startAP();
   }
