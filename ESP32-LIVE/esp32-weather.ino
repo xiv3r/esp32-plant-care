@@ -1,6 +1,10 @@
 /*
 =================================================
- * ESP32 Unified Weather Controlled Relay
+ESP32 Unified Weather Controlled Relay
+
+* Author: Raff Alds
+* Github: github.com/xiv3r
+* License: GPLv3
 =================================================
 */
 
@@ -234,6 +238,7 @@ void sanitizeSettings() {
   if (cfg.apPassword.length() > 63) cfg.apPassword = cfg.apPassword.substring(0, 63);
   if (cfg.apSsid.length() > 32) cfg.apSsid = cfg.apSsid.substring(0, 32);
   if (cfg.ssid.length() > 32) cfg.ssid = cfg.ssid.substring(0, 32);
+  if (cfg.password.length() > 63) cfg.password = cfg.password.substring(0, 63);
   if (locationCount > MAX_LOCATIONS) locationCount = MAX_LOCATIONS;
   for (uint8_t i = 0; i < locationCount; i++) {
     if (locations[i].name.length() > 32) locations[i].name = locations[i].name.substring(0, 32);
@@ -469,10 +474,13 @@ void evaluateRelay() {
     return;
   }
   int onLocations = 0, offLocations = 0, decidedLocations = 0;
+  int freshEnabledCount = 0;
   bool anyFresh = false;
   for (uint8_t i = 0; i < locationCount; i++) {
     if (!locations[i].enabled) continue;
-    if (wx[i].valid && (uptimeMs() - wx[i].lastOkMs64 <= (uint64_t)WEATHER_STALE_MS)) anyFresh = true;
+    bool fresh = wx[i].valid &&
+                 (uptimeMs() - wx[i].lastOkMs64 <= (uint64_t)WEATHER_STALE_MS);
+    if (fresh) { anyFresh = true; freshEnabledCount++; }
     int8_t r = evaluateLocation(i);
     if (r ==  1) { onLocations++;  decidedLocations++; }
     if (r == -1) { offLocations++; decidedLocations++; }
@@ -484,8 +492,8 @@ void evaluateRelay() {
   if (decidedLocations == 0) return;
   bool wantOn = relayIsOn;
   if (cfg.multiLogicAll) {
-    if (onLocations == enabledCount)        wantOn = true;
-    else if (offLocations == enabledCount)  wantOn = false;
+    if (onLocations  == freshEnabledCount) wantOn = true;
+    else if (offLocations == freshEnabledCount) wantOn = false;
   } else {
     bool anyOn  = onLocations  > 0;
     bool anyOff = offLocations > 0;
@@ -500,19 +508,37 @@ void evaluateRelay() {
 //  WEATHER
 // =====================================================================
 String wmoDesc(int code) {
-  static const char* d[] = {
-    "Clear","Mainly clear","Partly cloudy","Overcast",
-    "Fog","Rime fog","Light drizzle","Moderate drizzle","Dense drizzle",
-    "Light freezing drizzle","Dense freezing drizzle",
-    "Slight rain","Moderate rain","Heavy rain",
-    "Light freezing rain","Heavy freezing rain",
-    "Slight snow","Moderate snow","Heavy snow","Snow grains",
-    "Slight showers","Moderate showers","Violent showers",
-    "Slight snow showers","Heavy snow showers",
-    "Thunderstorm","Thunderstorm w/ hail"
-  };
-  if (code < 0 || code >= (int)(sizeof(d)/sizeof(d[0]))) return "Unknown";
-  return String(d[code]);
+  switch (code) {
+    case 0:  return "Clear";
+    case 1:  return "Mainly clear";
+    case 2:  return "Partly cloudy";
+    case 3:  return "Overcast";
+    case 45: return "Fog";
+    case 48: return "Rime fog";
+    case 51: return "Light drizzle";
+    case 53: return "Moderate drizzle";
+    case 55: return "Dense drizzle";
+    case 56: return "Light freezing drizzle";
+    case 57: return "Dense freezing drizzle";
+    case 61: return "Slight rain";
+    case 63: return "Moderate rain";
+    case 65: return "Heavy rain";
+    case 66: return "Light freezing rain";
+    case 67: return "Heavy freezing rain";
+    case 71: return "Slight snow";
+    case 73: return "Moderate snow";
+    case 75: return "Heavy snow";
+    case 77: return "Snow grains";
+    case 80: return "Slight showers";
+    case 81: return "Moderate showers";
+    case 82: return "Violent showers";
+    case 85: return "Slight snow showers";
+    case 86: return "Heavy snow showers";
+    case 95: return "Thunderstorm";
+    case 96: return "Thunderstorm w/ hail";
+    case 99: return "Thunderstorm w/ hail";
+    default: return "Unknown";
+  }
 }
 String wmoIcon(int code) {
   if (code < 0 || code > 99) return "❓";
@@ -1328,7 +1354,12 @@ void handleWifiApSave() {
 
 void handleNotFound() {
   if (apMode) {
-    server.sendHeader("Location", "http://" + WiFi.softAPIP().toString() + "/", true);
+    IPAddress host = server.client().localIP();
+    String hostStr = host.toString();
+    if (hostStr == "0.0.0.0" || hostStr.length() == 0) {
+      hostStr = WiFi.softAPIP().toString();
+    }
+    server.sendHeader("Location", "http://" + hostStr + "/", true);
     server.send(302, "text/plain", "");
   } else {
     server.send(404, "text/plain", "Not found");
@@ -1450,9 +1481,10 @@ void setup() {
   WiFi.setAutoReconnect(true);
   staManualDisable = false;
   bool staOk = false;
+  if (cfg.apEnabled) startAP();
   if (cfg.ssid.length() > 0) staOk = startSTA();
   if (cfg.apEnabled || !staOk) {
-    startAP();
+    if (!apMode) startAP(); 
   }
   if (staOk) {
     fetchWeather();
@@ -1477,7 +1509,11 @@ void setup() {
   server.on("/api/status",       handleApiStatus);
   auto redir = []() {
     if (apMode) {
-      server.sendHeader("Location", "http://" + WiFi.softAPIP().toString() + "/", true);
+      String hostStr = server.client().localIP().toString();
+      if (hostStr == "0.0.0.0" || hostStr.length() == 0) {
+        hostStr = WiFi.softAPIP().toString();
+      }
+      server.sendHeader("Location", "http://" + hostStr + "/", true);
       server.send(302, "text/plain", "");
     } else {
       server.send(404, "text/plain", "Not found");
