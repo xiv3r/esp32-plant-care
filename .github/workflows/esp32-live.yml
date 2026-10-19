@@ -30,6 +30,8 @@ jobs:
         arduino-cli core update-index
         arduino-cli core install esp32:esp32
 
+        arduino-cli lib install "ArduinoJson"
+
         # Compile firmware
         cd ESP32-LIVE 
         mv *.ino ESP32-LIVE.ino
