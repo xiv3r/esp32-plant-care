@@ -957,9 +957,7 @@ String scanPage() {
   wifi_mode_t prev = WiFi.getMode();
   WiFi.mode(WIFI_AP_STA);
   delay(50);
-  esp_task_wdt_reset();
   int n = WiFi.scanNetworks(false, true);
-  esp_task_wdt_reset();
   WiFi.mode(prev);
 
   s += "<div class='card'>";
@@ -1445,18 +1443,6 @@ void handleBootButton() {
 // =====================================================================
 void setup() {
   g_uptimeLast = millis();
-#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
-  {
-    esp_task_wdt_config_t twdt_cfg = { 60000, 0, true };
-    esp_err_t err = esp_task_wdt_init(&twdt_cfg);
-    if (err == ESP_ERR_INVALID_STATE) {
-      esp_task_wdt_reconfigure(&twdt_cfg);
-    }
-  }
-#else
-  esp_task_wdt_init(60, true);
-#endif
-  esp_task_wdt_add(NULL);
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
   loadSettings();
   initRelayPin();
@@ -1511,7 +1497,6 @@ void setup() {
 //  LOOP
 // =====================================================================
 void loop() {
-  esp_task_wdt_reset();
   uptimeTick();
   handleBootButton();
   if (apMode) dns.processNextRequest();
