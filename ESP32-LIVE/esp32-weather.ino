@@ -651,6 +651,7 @@ String htmlHeader(const String &title) {
   return s;
 }
 String htmlFooter() { return F("</div></body></html>"); }
+
 String cRow(const String &name, bool checked, const String &label) {
   return String("<label><input type='checkbox' name='") + name + "' value='1'"
        + (checked ? " checked" : "") + ">" + label + "</label>";
@@ -1032,7 +1033,6 @@ void startAP() {
     ok = WiFi.softAP(apSsidRuntime.c_str(), nullptr, apCh, false, 4);
   }
   if (!ok) {
-    Serial.println("softAP failed");
     apMode = false;
     return;
   }
@@ -1458,7 +1458,6 @@ void setup() {
 #endif
   esp_task_wdt_add(NULL);
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
-  Serial.begin(115200);
   loadSettings();
   initRelayPin();
   WiFi.persistent(false);
