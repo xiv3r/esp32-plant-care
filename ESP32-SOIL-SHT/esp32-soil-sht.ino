@@ -831,7 +831,7 @@ bool beginSHT31() {
   for (uint8_t i = 0; i < 2; i++) {
     if (sht31.begin(addrs[i])) {
       shtAddr = addrs[i];
-      sht31.setHeater(false);
+      sht31.heater(false);
       shtReady = true;
       shtFailCount = 0;
       return true;
