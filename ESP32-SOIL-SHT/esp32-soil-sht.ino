@@ -667,8 +667,7 @@ void readSensors(){
     if (shtOK){
         float t = sht31.readTemperature();
         float h = sht31.readHumidity();
-        bool connected = sht31.isConnected();
-        bool valid = connected && !isnan(t) && !isnan(h) &&
+        bool valid = !isnan(t) && !isnan(h) &&
                      t >= -40.0f && t <= 125.0f &&
                      h >= 0.0f  && h <= 100.1f;
         if (valid){
