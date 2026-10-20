@@ -1,4 +1,4 @@
-name: Build ESP32 3 Sensor Firmware
+name: Build ESP32 Soil & SHT Firmware
 
 on:
   push:
