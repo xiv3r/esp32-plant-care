@@ -1,5 +1,5 @@
 /*
- * ESP32 Unified Garden Control System — v3 (quadruple-verified, no Serial)
+ * ESP32 Unified Garden Control System
  * ========================================================================
  * Sensors : Capacitive soil moisture (GPIO34) + SHT31 (I2C 21/22)
  * Actuator: Relay GPIO25 (auto + manual override)
