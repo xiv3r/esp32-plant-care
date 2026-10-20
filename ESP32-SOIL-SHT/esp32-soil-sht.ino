@@ -865,6 +865,16 @@ bool shtReadingFresh() {
     staleMs = SENSOR_STALE_MIN_MS;
   }
 
+  if (shtFailCount >= 2) {
+    unsigned long tightMs = (unsigned long)settings.sensorInterval * 2000UL;
+    if (tightMs < 5000UL) tightMs = 5000UL;
+    if (tightMs < staleMs) staleMs = tightMs;
+  } else if (shtFailCount == 1) {
+    unsigned long tightMs = (unsigned long)settings.sensorInterval * 4000UL;
+    if (tightMs < 10000UL) tightMs = 10000UL;
+    if (tightMs < staleMs) staleMs = tightMs;
+  }
+
   return (millis() - shtLastValidMs) <= staleMs;
 }
 
@@ -1638,9 +1648,9 @@ button.danger{background:#7f1d1d;border-color:#ef4444}
       <div id="relayState" class="big off">--</div>
       <div class="muted small">Reason: <span id="relayReason">--</span></div>
       <div class="btnrow">
-        <button type="button" onclick="setMode('auto')">Auto</button>
-        <button type="button" onclick="setMode('off')">Manual Off</button>
-        <button type="button" onclick="setMode('on')">Manual On</button>
+        <button type="button" id="btnModeAuto" onclick="setMode('auto')">Auto</button>
+        <button type="button" id="btnModeOff"  onclick="setMode('off')">Manual Off</button>
+        <button type="button" id="btnModeOn"   onclick="setMode('on')">Manual On</button>
       </div>
       <div class="muted small" style="margin-top:8px">
         Mode: <span id="controlMode">--</span> &middot; Last change: <span id="relayAge">--</span>
@@ -1698,16 +1708,16 @@ button.danger{background:#7f1d1d;border-color:#ef4444}
           Enable soil rule
         </label>
         <label>Dry threshold (%)
-          <input type="number" step="0.1" min="0" max="100" name="soilThreshold" id="soilThreshold">
+          <input type="number" required step="0.1" min="0" max="100" name="soilThreshold" id="soilThreshold">
         </label>
         <label>Hysteresis (%)
-          <input type="number" step="0.1" min="0" max="100" name="soilHysteresis" id="soilHysteresis">
+          <input type="number" required step="0.1" min="0" max="100" name="soilHysteresis" id="soilHysteresis">
         </label>
         <label>Dry calibration raw
-          <input type="number" step="1" min="0" max="4095" name="soilDryRaw" id="soilDryRaw">
+          <input type="number" required step="1" min="0" max="4095" name="soilDryRaw" id="soilDryRaw">
         </label>
         <label>Wet calibration raw
-          <input type="number" step="1" min="0" max="4095" name="soilWetRaw" id="soilWetRaw">
+          <input type="number" required step="1" min="0" max="4095" name="soilWetRaw" id="soilWetRaw">
         </label>
         <div class="btnrow">
           <button type="button" onclick="calibrateSoil('dry')">Calibrate Dry Now</button>
@@ -1723,10 +1733,10 @@ button.danger{background:#7f1d1d;border-color:#ef4444}
           Enable temperature rule
         </label>
         <label>Threshold (&deg;C)
-          <input type="number" step="0.1" min="-40" max="125" name="tempThreshold" id="tempThreshold">
+          <input type="number" required step="0.1" min="-40" max="125" name="tempThreshold" id="tempThreshold">
         </label>
         <label>Hysteresis (&deg;C)
-          <input type="number" step="0.1" min="0" max="125" name="tempHysteresis" id="tempHysteresis">
+          <input type="number" required step="0.1" min="0" max="125" name="tempHysteresis" id="tempHysteresis">
         </label>
         <label>Trigger direction
           <select name="tempDirection" id="tempDirection">
@@ -1735,6 +1745,7 @@ button.danger{background:#7f1d1d;border-color:#ef4444}
           </select>
         </label>
       </div>
+      <p class="muted small">Temperature rule activates when the reading crosses the threshold, and clears at threshold &plusmn; hysteresis (sign depends on direction).</p>
 
       <h3>SHT31 Humidity Rule</h3>
       <div class="form-grid">
@@ -1743,10 +1754,10 @@ button.danger{background:#7f1d1d;border-color:#ef4444}
           Enable humidity rule
         </label>
         <label>Threshold (%RH)
-          <input type="number" step="0.1" min="0" max="100" name="humThreshold" id="humThreshold">
+          <input type="number" required step="0.1" min="0" max="100" name="humThreshold" id="humThreshold">
         </label>
         <label>Hysteresis (%RH)
-          <input type="number" step="0.1" min="0" max="100" name="humHysteresis" id="humHysteresis">
+          <input type="number" required step="0.1" min="0" max="100" name="humHysteresis" id="humHysteresis">
         </label>
         <label>Trigger direction
           <select name="humDirection" id="humDirection">
@@ -1755,6 +1766,7 @@ button.danger{background:#7f1d1d;border-color:#ef4444}
           </select>
         </label>
       </div>
+      <p class="muted small">Humidity rule activates when the reading crosses the threshold, and clears at threshold &plusmn; hysteresis (sign depends on direction).</p>
     </section>
 
     <section class="card">
@@ -1765,13 +1777,13 @@ button.danger{background:#7f1d1d;border-color:#ef4444}
           Relay is active LOW
         </label>
         <label>Minimum ON time (ms)
-          <input type="number" min="0" max="3600000" step="100" name="relayMinOnMs" id="relayMinOnMs">
+          <input type="number" required min="0" max="3600000" step="100" name="relayMinOnMs" id="relayMinOnMs">
         </label>
         <label>Minimum OFF time (ms)
-          <input type="number" min="0" max="3600000" step="100" name="relayMinOffMs" id="relayMinOffMs">
+          <input type="number" required min="0" max="3600000" step="100" name="relayMinOffMs" id="relayMinOffMs">
         </label>
         <label>Sensor sample interval (seconds)
-          <input type="number" min="1" max="60" step="1" name="sensorInterval" id="sensorInterval">
+          <input type="number" required min="1" max="60" step="1" name="sensorInterval" id="sensorInterval">
         </label>
       </div>
     </section>
@@ -1788,6 +1800,10 @@ button.danger{background:#7f1d1d;border-color:#ef4444}
         </label>
         <label>Password
           <input type="password" maxlength="63" name="staPass" id="staPass" autocomplete="new-password">
+        </label>
+        <label class="check">
+          <input type="checkbox" name="clearStaPass" id="clearStaPass">
+          Clear stored STA password
         </label>
         <div class="btnrow">
           <button type="button" onclick="forgetSta()">Forget STA</button>
@@ -1819,11 +1835,15 @@ button.danger{background:#7f1d1d;border-color:#ef4444}
         <label>AP password
           <input type="password" maxlength="63" name="apPass" id="apPass" autocomplete="new-password">
         </label>
+        <label class="check">
+          <input type="checkbox" name="clearApPass" id="clearApPass">
+          Clear stored AP password
+        </label>
         <label>AP channel
-          <input type="number" min="1" max="13" name="apChannel" id="apChannel">
+          <input type="number" required min="1" max="13" name="apChannel" id="apChannel">
         </label>
         <label>AP max clients
-          <input type="number" min="1" max="4" name="apMaxClients" id="apMaxClients">
+          <input type="number" required min="1" max="4" name="apMaxClients" id="apMaxClients">
         </label>
       </div>
       <p class="muted small">AP password empty = open. Otherwise use 8-63 characters.</p>
@@ -1963,6 +1983,13 @@ async function loadSettings(silent) {
       if (el) el.value = (d[k] === undefined || d[k] === null) ? '' : d[k];
     }
 
+    $('staPass').value = '';
+    $('staPass').placeholder = d.staPassSet ? '(unchanged — check below to clear)' : '';
+    $('apPass').value = '';
+    $('apPass').placeholder = d.apPassSet ? '(unchanged — check below to clear)' : '';
+    if ($('clearStaPass')) $('clearStaPass').checked = false;
+    if ($('clearApPass')) $('clearApPass').checked = false;
+
     $('combine').value = d.combineAny ? 'any' : 'all';
     $('tempDirection').value = d.tempTriggerAbove ? 'above' : 'below';
     $('humDirection').value = d.humTriggerAbove ? 'above' : 'below';
@@ -1992,6 +2019,14 @@ async function pollStatus() {
     $('relayReason').textContent = d.control.reason || '--';
     $('controlMode').textContent = (d.control.mode || '--').toUpperCase();
     $('relayAge').textContent = formatDuration(d.control.ageSec || 0);
+
+    const modeMap = { auto: 'btnModeAuto', off: 'btnModeOff', on: 'btnModeOn' };
+    for (const k in modeMap) {
+      const b = $(modeMap[k]);
+      if (!b) continue;
+      const active = (d.control.mode === k);
+      b.classList.toggle('primary', active);
+    }
 
     $('soilPct').textContent = fmt(d.soil.percent, 1);
     $('soilRaw').textContent = fmt(d.soil.raw, 0);
@@ -2185,10 +2220,14 @@ $('settingsForm').addEventListener('submit', async (ev) => {
       body: body
     }, 20000);
 
+    let savedNote = '';
+    if (d.hostname && d.hostname !== $('hostname').value.trim()) {
+      savedNote = ' Hostname saved as "' + d.hostname + '".';
+    }
     if (d.networkReconfig) {
-      showMsg('Settings saved. Network is reconfiguring; reconnect if the connection drops.', 'ok');
+      showMsg('Settings saved. Network is reconfiguring; reconnect if the connection drops.' + savedNote, 'ok');
     } else {
-      showMsg('Settings saved and applied.', 'ok');
+      showMsg('Settings saved and applied.' + savedNote, 'ok');
     }
 
     await pollStatus();
@@ -2277,7 +2316,11 @@ void handleStatus() {
   j += ",\"valid\":";
   j += boolJson(soilFresh);
   j += ",\"raw\":";
-  j += jf(soilRawFiltered);
+  if (soilFresh) {
+    j += jf(soilRawFiltered);
+  } else {
+    j += "null";
+  }
   j += ",\"percent\":";
   j += jf(soilOut);
   j += ",\"threshold\":";
@@ -2361,9 +2404,9 @@ void handleGetSettings() {
   j += ",\"staSsid\":\"";
   j += jsonEscape(settings.staSsid);
   j += "\"";
-  j += ",\"staPass\":\"";
-  j += jsonEscape(settings.staPass);
-  j += "\"";
+  j += ",\"staPass\":\"\"";
+  j += ",\"staPassSet\":";
+  j += boolJson(settings.staPass.length() > 0);
 
   j += ",\"apEnabled\":";
   j += boolJson(settings.apEnabled);
@@ -2378,9 +2421,9 @@ void handleGetSettings() {
   j += ",\"apSsid\":\"";
   j += jsonEscape(settings.apSsid);
   j += "\"";
-  j += ",\"apPass\":\"";
-  j += jsonEscape(settings.apPass);
-  j += "\"";
+  j += ",\"apPass\":\"\"";
+  j += ",\"apPassSet\":";
+  j += boolJson(settings.apPass.length() > 0);
   j += ",\"apMaxClients\":";
   j += String(settings.apMaxClients);
 
@@ -2457,6 +2500,11 @@ void handlePostSettings() {
     sendError(400, err);
     return;
   }
+  if (getBoolArg("clearStaPass")) {
+    next.staPass = "";
+  } else if (next.staPass.length() == 0 && settings.staPass.length() > 0) {
+    next.staPass = settings.staPass;
+  }
 
   next.apEnabled = getBoolArg("apEnabled");
   next.apFallback = getBoolArg("apFallback");
@@ -2477,6 +2525,11 @@ void handlePostSettings() {
   if (!getStringArg("apPass", next.apPass, err)) {
     sendError(400, err);
     return;
+  }
+  if (getBoolArg("clearApPass")) {
+    next.apPass = "";
+  } else if (next.apPass.length() == 0 && settings.apPass.length() > 0) {
+    next.apPass = settings.apPass;
   }
 
   if (!readIntArg("apMaxClients", tmpInt, 1, 4, err)) {
@@ -2606,13 +2659,21 @@ void handlePostSettings() {
   }
 
   Settings old = settings;
+  bool calibrationChanged =
+    (old.soilDryRaw != next.soilDryRaw) ||
+    (old.soilWetRaw != next.soilWetRaw);
   settings = next;
 
   saveSettings();
   resetConditionHysteresis();
 
+  if (calibrationChanged) {
+    soilRawFiltered = NAN;
+  }
+
   writeRelayOutput(relayState);
 
+  lastSensorReadMs = 0;
   readSensors(true);
   serviceRelay();
 
@@ -2625,7 +2686,9 @@ void handlePostSettings() {
 
   String resp = "{\"ok\":true,\"networkReconfig\":";
   resp += boolJson(netChanged);
-  resp += "}";
+  resp += ",\"hostname\":\"";
+  resp += jsonEscape(settings.hostname);
+  resp += "\"}";
   sendJson(200, resp);
 }
 
@@ -2701,6 +2764,7 @@ void handleCalibrateSoil() {
   saveSettings();
   resetConditionHysteresis();
 
+  soilRawFiltered = NAN;
   lastSensorReadMs = 0;
   readSensors(true);
   serviceRelay();
@@ -2931,8 +2995,6 @@ void loop() {
   if (dnsActive) {
     dnsServer.processNextRequest();
   }
-
-  serviceRelay();
 
   delay(2);
 }
