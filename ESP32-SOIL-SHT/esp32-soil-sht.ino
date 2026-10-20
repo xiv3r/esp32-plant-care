@@ -1,23 +1,25 @@
 /*
- * ESP32 Unified Garden Control System
- * ========================================================================
- * Sensors : Capacitive soil moisture (GPIO34) + SHT31 (I2C 21/22)
- * Actuator: Relay GPIO25 (auto + manual override)
- * Network : WiFi AP + STA, captive portal, auto-reconnect
- * Reset   : GPIO0 5s hold (post-boot only; held-at-boot blocks boot)
- *
- * REQUIRED LIBRARIES (Library Manager):
- *   - "Adafruit SHT31 Library"  (by Adafruit)  -> pulls BusIO
- *   - "ArduinoJson"             (by Benoit Blanchon) — MUST be v6.x  (NOT v7)
- * Board: "ESP32 Dev Module"  (any ESP32 core 2.x/3.x)
- *
- * WIRING:
- *   Soil signal  -> GPIO34   (ADC1_CH6, input only)
- *   Soil VCC     -> 3V3      Soil GND -> GND
- *   SHT31 SDA    -> GPIO21   SHT31 SCL -> GPIO22   VCC 3V3   GND GND
- *   Relay IN     -> GPIO25   Relay VCC/GND per module (5V for most)
- *   Boot button  -> GPIO0 (onboard; do NOT hold during power-on)
- */
+  ESP32 Unified Environmental Relay Controller
+
+  Hardware assumptions:
+  - Capacitive soil moisture analog output: GPIO34
+  - SHT31 I2C: SDA GPIO21, SCL GPIO22 (address 0x44 or 0x45)
+  - Relay: GPIO25 (default active LOW)
+  - Boot/factory-reset button: GPIO0 to GND, held LOW 5 seconds
+  - Default AP: ESP32-Env / 12345678
+
+  Required libraries:
+  - ESP32 board package
+  - Adafruit SHT31 Library
+  - Adafruit BusIO
+
+  IMPORTANT:
+  - No firmware can be guaranteed correct in every possible scenario.
+  - The web UI has no authentication. Use only on trusted networks.
+  - Verify all wiring and relay polarity before connecting a load.
+  - GPIO34 is input-only.
+  - Change the default AP password immediately.
+*/
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -25,878 +27,2912 @@
 #include <Preferences.h>
 #include <Wire.h>
 #include <Adafruit_SHT31.h>
-#include <ArduinoJson.h>
+#include <ESPmDNS.h>
+#include <math.h>
+#include <ctype.h>
+#include <stdlib.h>
 
-// ================= PINS =================
-#define PIN_SOIL        34
-#define PIN_RELAY       25
-#define PIN_BOOT_BTN     0
-#define PIN_SDA         21
-#define PIN_SCL         22
+// -------------------- Hardware pins / constants --------------------
 
-// ================= CONSTANTS =================
-#define AP_SSID              "ESP32_SoilM_SHT31"
-#define AP_PASSWORD          "12345678"
-#define DNS_PORT             53
-#define FACTORY_HOLD_MS      5000
-#define SENSOR_INTERVAL_MS   2000
-#define SHT_RETRY_MS         10000
-#define SHT_STALE_MS         30000
-#define WIFI_CONNECT_TIMEOUT 15000
-#define WIFI_RETRY_MS        30000
-#define MANUAL_OVERRIDE_MS   (5UL * 60UL * 1000UL)
-#define WIFI_HEALTH_MS       (30UL * 60UL * 1000UL)
+#define RELAY_PIN             25
+#define BOOT_BUTTON_PIN       0
+#define SOIL_PIN              34
+#define I2C_SDA_PIN           21
+#define I2C_SCL_PIN           22
 
-// ================= GLOBALS =================
-WebServer  server(80);
-DNSServer  dnsServer;
-Preferences prefs;
-Adafruit_SHT31 sht31 = Adafruit_SHT31();
+static const uint8_t SHT31_ADDR_PRIMARY = 0x44;
+static const uint8_t SHT31_ADDR_ALT     = 0x45;
+
+static const char* APP_VERSION = "1.0.2-audited";
+
+static const unsigned long BOOT_RESET_HOLD_MS   = 5000UL;
+static const unsigned long STA_RETRY_MS         = 30000UL;
+static const unsigned long AP_RETRY_MS          = 5000UL;
+static const unsigned long SENSOR_STALE_MIN_MS  = 30000UL;
+static const unsigned long SHT_RETRY_MS         = 10000UL;
+
+// -------------------- Runtime types --------------------
+
+enum RuntimeMode {
+  MODE_AUTO = 0,
+  MODE_OFF  = 1,
+  MODE_ON   = 2
+};
 
 struct Settings {
-    String staSSID          = "";
-    String staPass          = "";
-    bool   useSTA           = false;
-    int    soilDryRaw       = 3200;
-    int    soilWetRaw       = 1200;
-    int    soilThresholdPct = 30;
-    float  tempHighC        = 30.0f;
-    float  tempLowC         = 10.0f;
-    float  humHighPct       = 80.0f;
-    float  humLowPct        = 30.0f;
-    int    relayMode        = 0;
-    bool   relayActiveLow   = true;
-    String deviceName       = "ESP32-Garden";
-} cfg;
+  String hostname;
 
-// Runtime
-float soilPct = 0.0f;
-int   soilRaw = 0;
-bool  soilFault = false;
-float temperature = NAN;
-float humidity    = NAN;
+  bool staEnabled;
+  String staSsid;
+  String staPass;
+
+  bool apEnabled;
+  bool apFallback;
+  bool captivePortal;
+  bool apHidden;
+  uint8_t apChannel;
+  String apSsid;
+  String apPass;
+  uint8_t apMaxClients;
+
+  bool relayActiveLow;
+  bool failSafeOnSensorFault;
+  uint32_t relayMinOnMs;
+  uint32_t relayMinOffMs;
+  uint16_t sensorInterval;
+
+  bool soilEnabled;
+  float soilThreshold;
+  float soilHysteresis;
+  float soilDryRaw;
+  float soilWetRaw;
+
+  bool tempEnabled;
+  float tempThreshold;
+  float tempHysteresis;
+  bool tempTriggerAbove;
+
+  bool humEnabled;
+  float humThreshold;
+  float humHysteresis;
+  bool humTriggerAbove;
+
+  bool combineAny; 
+};
+
+struct AutoEval {
+  bool target;
+  bool fault;
+  bool soilActive;
+  bool tempActive;
+  bool humActive;
+  int enabledCount;
+  bool combineAny;
+  const char* reason;
+};
+
+// -------------------- Globals --------------------
+
+Preferences prefs;
+WebServer server(80);
+DNSServer dnsServer;
+Adafruit_SHT31 sht31 = Adafruit_SHT31();
+
+Settings settings;
+
+RuntimeMode runtimeMode = MODE_AUTO;
+
+bool relayState = false;
+const char* relayReason = "Boot - auto mode";
+unsigned long lastRelayChangeMs = 0;
+
+AutoEval lastEval;
+
+float soilRawFiltered = NAN;
+float soilPercent = NAN;
+bool soilValid = false;
+unsigned long soilLastValidMs = 0;
+
+float tempC = NAN;
+float humidity = NAN;
+bool shtValid = false;
+bool shtReady = false;
+uint8_t shtAddr = 0;
+uint8_t shtFailCount = 0;
+unsigned long lastShtInitAttempt = 0;
 unsigned long shtLastValidMs = 0;
-unsigned long shtLastRetryMs = 0;
-bool  shtOK = false;
-bool  relayState = false;
-bool  tempTrigLatched = false;
-bool  humTrigLatched  = false;
 
-unsigned long lastSensorRead = 0;
-unsigned long lastWifiRetry  = 0;
-bool  wifiWantConnect        = false;
-unsigned long lastWifiHealthCheck = 0;
+unsigned long lastSensorReadMs = 0;
 
-// Manual override
-bool          manualOverride      = false;
-bool          manualRelayWanted   = false;
-unsigned long manualOverrideStart = 0;
+bool soilActivePrev = false;
+bool tempActivePrev = false;
+bool humActivePrev = false;
 
-// Boot button
-unsigned long bootBtnPressStart = 0;
-bool          bootBtnPressed    = false;
-unsigned long lastShtErrLog = 0;
+bool apActive = false;
+bool dnsActive = false;
 
-// ================= FORWARD =================
-void loadSettings();
-void saveSettings();
-void setupWiFi();
-void setupWebServer();
-void setupCaptivePortal();
-void readSensors();
-void updateRelay();
-void driveRelay(bool on);
-void handleBootButton();
-void factoryReset();
-String getStatusJSON();
-String getSettingsJSON();
-void applySettingsFromJSON(JsonDocument &doc);
+bool networkDirty = false;
+unsigned long networkApplyAt = 0;
+unsigned long lastStaAttempt = 0;
+unsigned long lastAPAttempt = 0;
+unsigned long lastDNSAttempt = 0;
+unsigned long lastMdnsAttempt = 0;
 
-// ================= HTML DASHBOARD =================
-const char DASHBOARD_HTML[] PROGMEM = R"HTML(
-<!DOCTYPE html>
+bool mdnsStarted = false;
+String lastMdnsHostname = "";
+IPAddress lastMdnsIp(0, 0, 0, 0);
+
+bool bootButtonDown = false;
+unsigned long bootButtonDownMs = 0;
+bool bootResetTriggered = false;
+
+// Forward declarations
+void sendJson(int code, const String& body);
+void sendError(int code, const String& message);
+void serviceRelay();
+void reconfigureNetwork();
+void serviceNetwork();
+void resetConditionHysteresis();
+void doFactoryReset();
+
+// -------------------- Utility functions --------------------
+
+String jsonEscape(const String& s) {
+  String out;
+  out.reserve(s.length() + 8);
+
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    switch (c) {
+      case '"':
+        out += "\\\"";
+        break;
+      case '\\':
+        out += "\\\\";
+        break;
+      case '\b':
+        out += "\\b";
+        break;
+      case '\f':
+        out += "\\f";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      default:
+        if ((unsigned char)c < 0x20) {
+          char buf[7];
+          snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)c);
+          out += buf;
+        } else {
+          out += c;
+        }
+        break;
+    }
+  }
+
+  return out;
+}
+
+String jsonEscape(const char* s) {
+  if (s == nullptr) {
+    return "";
+  }
+  return jsonEscape(String(s));
+}
+
+String boolJson(bool v) {
+  return v ? "true" : "false";
+}
+
+String jf(float v) {
+  if (!isfinite(v)) {
+    return "null";
+  }
+  return String(v, 2);
+}
+
+float clampFloat(float v, float lo, float hi) {
+  if (!isfinite(v)) {
+    return lo;
+  }
+  if (v < lo) {
+    return lo;
+  }
+  if (v > hi) {
+    return hi;
+  }
+  return v;
+}
+
+String sanitizeHostname(String s) {
+  s.trim();
+  String out;
+  out.reserve(s.length());
+
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (isalnum((unsigned char)c) || c == '-') {
+      out += c;
+    }
+  }
+
+  while (out.length() > 0 && out[0] == '-') {
+    out.remove(0, 1);
+  }
+
+  while (out.length() > 0 && out[out.length() - 1] == '-') {
+    out.remove(out.length() - 1);
+  }
+
+  if (out.length() == 0) {
+    out = "esp32-env";
+  }
+
+  if (out.length() > 32) {
+    out = out.substring(0, 32);
+  }
+
+  while (out.length() > 0 && out[out.length() - 1] == '-') {
+    out.remove(out.length() - 1);
+  }
+
+  if (out.length() == 0) {
+    out = "esp32-env";
+  }
+
+  return out;
+}
+
+const char* modeName(RuntimeMode m) {
+  switch (m) {
+    case MODE_AUTO: return "auto";
+    case MODE_OFF:  return "off";
+    case MODE_ON:   return "on";
+    default:        return "auto";
+  }
+}
+
+const char* wifiStatusName(wl_status_t s) {
+  switch (s) {
+    case WL_IDLE_STATUS:      return "idle";
+    case WL_NO_SSID_AVAIL:    return "no_ssid";
+    case WL_SCAN_COMPLETED:   return "scan_completed";
+    case WL_CONNECTED:        return "connected";
+    case WL_CONNECT_FAILED:   return "connect_failed";
+    case WL_CONNECTION_LOST:  return "connection_lost";
+    case WL_DISCONNECTED:     return "disconnected";
+    default:                  return "unknown";
+  }
+}
+
+bool getBoolArg(const char* name) {
+  if (!server.hasArg(name)) {
+    return false;
+  }
+
+  String v = server.arg(name);
+  v.toLowerCase();
+
+  return v == "1" || v == "true" || v == "on" || v == "yes";
+}
+
+bool getStringArg(const char* name, String& out, String& err) {
+  if (!server.hasArg(name)) {
+    err = String("Missing field: ") + name;
+    return false;
+  }
+  out = server.arg(name);
+  return true;
+}
+
+bool readFloatArg(const char* name, float& out, float minValue, float maxValue, String& err) {
+  if (!server.hasArg(name)) {
+    err = String("Missing field: ") + name;
+    return false;
+  }
+
+  String s = server.arg(name);
+  s.trim();
+
+  if (s.length() == 0) {
+    err = String("Empty field: ") + name;
+    return false;
+  }
+
+  char* end = nullptr;
+  double v = strtod(s.c_str(), &end);
+
+  if (end == s.c_str() || *end != '\0' || !isfinite(v)) {
+    err = String("Invalid number: ") + name;
+    return false;
+  }
+
+  if (v < minValue || v > maxValue) {
+    err = String("Out of range: ") + name;
+    return false;
+  }
+
+  out = (float)v;
+  return true;
+}
+
+bool readIntArg(const char* name, int& out, int minValue, int maxValue, String& err) {
+  if (!server.hasArg(name)) {
+    err = String("Missing field: ") + name;
+    return false;
+  }
+
+  String s = server.arg(name);
+  s.trim();
+
+  if (s.length() == 0) {
+    err = String("Empty field: ") + name;
+    return false;
+  }
+
+  char* end = nullptr;
+  long v = strtol(s.c_str(), &end, 10);
+
+  if (end == s.c_str() || *end != '\0') {
+    err = String("Invalid integer: ") + name;
+    return false;
+  }
+
+  if (v < minValue || v > maxValue) {
+    err = String("Out of range: ") + name;
+    return false;
+  }
+
+  out = (int)v;
+  return true;
+}
+
+bool readULongArg(const char* name, uint32_t& out, uint32_t minValue, uint32_t maxValue, String& err) {
+  if (!server.hasArg(name)) {
+    err = String("Missing field: ") + name;
+    return false;
+  }
+
+  String s = server.arg(name);
+  s.trim();
+
+  if (s.length() == 0) {
+    err = String("Empty field: ") + name;
+    return false;
+  }
+
+  if (s.startsWith("-")) {
+    err = String("Negative value not allowed: ") + name;
+    return false;
+  }
+
+  char* end = nullptr;
+  unsigned long v = strtoul(s.c_str(), &end, 10);
+
+  if (end == s.c_str() || *end != '\0') {
+    err = String("Invalid unsigned integer: ") + name;
+    return false;
+  }
+
+  if (v < minValue || v > maxValue) {
+    err = String("Out of range: ") + name;
+    return false;
+  }
+
+  out = (uint32_t)v;
+  return true;
+}
+
+void sendJson(int code, const String& body) {
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  server.send(code, "application/json", body);
+}
+
+void sendError(int code, const String& message) {
+  String body = "{\"ok\":false,\"error\":\"";
+  body += jsonEscape(message);
+  body += "\"}";
+  sendJson(code, body);
+}
+
+// -------------------- Settings persistence --------------------
+
+void loadDefaults() {
+  settings.hostname = "esp32-env";
+
+  settings.staEnabled = false;
+  settings.staSsid = "";
+  settings.staPass = "";
+
+  settings.apEnabled = true;
+  settings.apFallback = true;
+  settings.captivePortal = true;
+  settings.apHidden = false;
+  settings.apChannel = 1;
+  settings.apSsid = "ESP32-Env";
+  settings.apPass = "12345678";
+  settings.apMaxClients = 4;
+
+  settings.relayActiveLow = true;
+  settings.failSafeOnSensorFault = true;
+  settings.relayMinOnMs = 5000UL;
+  settings.relayMinOffMs = 5000UL;
+  settings.sensorInterval = 2;
+
+  settings.soilEnabled = true;
+  settings.soilThreshold = 35.0f;
+  settings.soilHysteresis = 5.0f;
+  settings.soilDryRaw = 3200.0f;
+  settings.soilWetRaw = 1200.0f;
+
+  settings.tempEnabled = false;
+  settings.tempThreshold = 35.0f;
+  settings.tempHysteresis = 2.0f;
+  settings.tempTriggerAbove = true;
+
+  settings.humEnabled = false;
+  settings.humThreshold = 40.0f;
+  settings.humHysteresis = 5.0f;
+  settings.humTriggerAbove = false;
+
+  settings.combineAny = false;
+}
+
+void sanitizeLoadedSettings() {
+  settings.hostname = sanitizeHostname(settings.hostname);
+
+  if (settings.staSsid.length() > 32) {
+    settings.staSsid = settings.staSsid.substring(0, 32);
+  }
+
+  if (settings.staPass.length() > 0 &&
+      (settings.staPass.length() < 8 || settings.staPass.length() > 63)) {
+    settings.staPass = "";
+  }
+
+  if (settings.apSsid.length() > 32) {
+    settings.apSsid = settings.apSsid.substring(0, 32);
+  }
+
+  if (settings.apSsid.length() == 0) {
+    settings.apSsid = "ESP32-Env";
+  }
+
+  if (settings.apPass.length() > 0 &&
+      (settings.apPass.length() < 8 || settings.apPass.length() > 63)) {
+    settings.apPass = "12345678";
+  }
+
+  if (settings.apChannel < 1 || settings.apChannel > 13) {
+    settings.apChannel = 1;
+  }
+
+  if (settings.apMaxClients < 1 || settings.apMaxClients > 4) {
+    settings.apMaxClients = 4;
+  }
+
+  if (settings.staEnabled && settings.staSsid.length() == 0) {
+    settings.staEnabled = false;
+  }
+
+  if (!settings.staEnabled && !settings.apEnabled) {
+    settings.apEnabled = true;
+  }
+
+  settings.soilThreshold = clampFloat(settings.soilThreshold, 0.0f, 100.0f);
+  settings.soilHysteresis = clampFloat(settings.soilHysteresis, 0.0f, 100.0f);
+  settings.soilDryRaw = clampFloat(settings.soilDryRaw, 0.0f, 4095.0f);
+  settings.soilWetRaw = clampFloat(settings.soilWetRaw, 0.0f, 4095.0f);
+
+  if (fabs(settings.soilDryRaw - settings.soilWetRaw) < 25.0f) {
+    settings.soilDryRaw = 3200.0f;
+    settings.soilWetRaw = 1200.0f;
+  }
+
+  settings.tempThreshold = clampFloat(settings.tempThreshold, -40.0f, 125.0f);
+  settings.tempHysteresis = clampFloat(settings.tempHysteresis, 0.0f, 125.0f);
+
+  settings.humThreshold = clampFloat(settings.humThreshold, 0.0f, 100.0f);
+  settings.humHysteresis = clampFloat(settings.humHysteresis, 0.0f, 100.0f);
+
+  if (settings.sensorInterval < 1) {
+    settings.sensorInterval = 2;
+  }
+  if (settings.sensorInterval > 60) {
+    settings.sensorInterval = 60;
+  }
+
+  if (settings.relayMinOnMs > 3600000UL) {
+    settings.relayMinOnMs = 3600000UL;
+  }
+  if (settings.relayMinOffMs > 3600000UL) {
+    settings.relayMinOffMs = 3600000UL;
+  }
+}
+
+void loadSettings() {
+  loadDefaults();
+
+  if (prefs.begin("envmon", true)) {
+    settings.hostname = prefs.getString("host", settings.hostname);
+
+    settings.staEnabled = prefs.getBool("staEn", settings.staEnabled);
+    settings.staSsid = prefs.getString("staSsid", settings.staSsid);
+    settings.staPass = prefs.getString("staPass", settings.staPass);
+
+    settings.apEnabled = prefs.getBool("apEn", settings.apEnabled);
+    settings.apFallback = prefs.getBool("apFall", settings.apFallback);
+    settings.captivePortal = prefs.getBool("portal", settings.captivePortal);
+    settings.apHidden = prefs.getBool("apHide", settings.apHidden);
+    settings.apChannel = (uint8_t)prefs.getUInt("apCh", settings.apChannel);
+    settings.apSsid = prefs.getString("apSsid", settings.apSsid);
+    settings.apPass = prefs.getString("apPass", settings.apPass);
+    settings.apMaxClients = (uint8_t)prefs.getUInt("apMax", settings.apMaxClients);
+
+    settings.relayActiveLow = prefs.getBool("relayLow", settings.relayActiveLow);
+    settings.failSafeOnSensorFault = prefs.getBool("failSafe", settings.failSafeOnSensorFault);
+    settings.relayMinOnMs = prefs.getULong("minOn", settings.relayMinOnMs);
+    settings.relayMinOffMs = prefs.getULong("minOff", settings.relayMinOffMs);
+    settings.sensorInterval = (uint16_t)prefs.getUInt("sensorInt", settings.sensorInterval);
+
+    settings.soilEnabled = prefs.getBool("soilEn", settings.soilEnabled);
+    settings.soilThreshold = prefs.getFloat("soilThr", settings.soilThreshold);
+    settings.soilHysteresis = prefs.getFloat("soilHys", settings.soilHysteresis);
+    settings.soilDryRaw = prefs.getFloat("soilDry", settings.soilDryRaw);
+    settings.soilWetRaw = prefs.getFloat("soilWet", settings.soilWetRaw);
+
+    settings.tempEnabled = prefs.getBool("tempEn", settings.tempEnabled);
+    settings.tempThreshold = prefs.getFloat("tempThr", settings.tempThreshold);
+    settings.tempHysteresis = prefs.getFloat("tempHys", settings.tempHysteresis);
+    settings.tempTriggerAbove = prefs.getBool("tempAbove", settings.tempTriggerAbove);
+
+    settings.humEnabled = prefs.getBool("humEn", settings.humEnabled);
+    settings.humThreshold = prefs.getFloat("humThr", settings.humThreshold);
+    settings.humHysteresis = prefs.getFloat("humHys", settings.humHysteresis);
+    settings.humTriggerAbove = prefs.getBool("humAbove", settings.humTriggerAbove);
+
+    settings.combineAny = prefs.getBool("combAny", settings.combineAny);
+
+    prefs.end();
+  }
+
+  sanitizeLoadedSettings();
+}
+
+void saveSettings() {
+  if (prefs.begin("envmon", false)) {
+    prefs.putString("host", settings.hostname);
+
+    prefs.putBool("staEn", settings.staEnabled);
+    prefs.putString("staSsid", settings.staSsid);
+    prefs.putString("staPass", settings.staPass);
+
+    prefs.putBool("apEn", settings.apEnabled);
+    prefs.putBool("apFall", settings.apFallback);
+    prefs.putBool("portal", settings.captivePortal);
+    prefs.putBool("apHide", settings.apHidden);
+    prefs.putUInt("apCh", settings.apChannel);
+    prefs.putString("apSsid", settings.apSsid);
+    prefs.putString("apPass", settings.apPass);
+    prefs.putUInt("apMax", settings.apMaxClients);
+
+    prefs.putBool("relayLow", settings.relayActiveLow);
+    prefs.putBool("failSafe", settings.failSafeOnSensorFault);
+    prefs.putULong("minOn", settings.relayMinOnMs);
+    prefs.putULong("minOff", settings.relayMinOffMs);
+    prefs.putUInt("sensorInt", settings.sensorInterval);
+
+    prefs.putBool("soilEn", settings.soilEnabled);
+    prefs.putFloat("soilThr", settings.soilThreshold);
+    prefs.putFloat("soilHys", settings.soilHysteresis);
+    prefs.putFloat("soilDry", settings.soilDryRaw);
+    prefs.putFloat("soilWet", settings.soilWetRaw);
+
+    prefs.putBool("tempEn", settings.tempEnabled);
+    prefs.putFloat("tempThr", settings.tempThreshold);
+    prefs.putFloat("tempHys", settings.tempHysteresis);
+    prefs.putBool("tempAbove", settings.tempTriggerAbove);
+
+    prefs.putBool("humEn", settings.humEnabled);
+    prefs.putFloat("humThr", settings.humThreshold);
+    prefs.putFloat("humHys", settings.humHysteresis);
+    prefs.putBool("humAbove", settings.humTriggerAbove);
+
+    prefs.putBool("combAny", settings.combineAny);
+
+    prefs.end();
+  }
+}
+
+bool validateSettings(const Settings& s, String& err) {
+  if (s.hostname.length() == 0 || s.hostname.length() > 32) {
+    err = "Hostname must be 1-32 characters.";
+    return false;
+  }
+
+  if (s.staSsid.length() > 32) {
+    err = "STA SSID must be <=32 characters.";
+    return false;
+  }
+
+  if (s.staEnabled && s.staSsid.length() == 0) {
+    err = "STA is enabled but SSID is empty.";
+    return false;
+  }
+
+  if (s.staPass.length() > 0 &&
+      (s.staPass.length() < 8 || s.staPass.length() > 63)) {
+    err = "STA password must be empty or 8-63 characters.";
+    return false;
+  }
+
+  if (s.apSsid.length() > 32) {
+    err = "AP SSID must be <=32 characters.";
+    return false;
+  }
+
+  bool apRequired = s.apEnabled || (s.staEnabled && s.apFallback);
+
+  if (apRequired && s.apSsid.length() == 0) {
+    err = "AP SSID is required when AP or fallback AP can be active.";
+    return false;
+  }
+
+  if (s.apPass.length() > 0 &&
+      (s.apPass.length() < 8 || s.apPass.length() > 63)) {
+    err = "AP password must be empty or 8-63 characters.";
+    return false;
+  }
+
+  if (s.apChannel < 1 || s.apChannel > 13) {
+    err = "AP channel must be 1-13.";
+    return false;
+  }
+
+  if (s.apMaxClients < 1 || s.apMaxClients > 4) {
+    err = "AP max clients must be 1-4.";
+    return false;
+  }
+
+  if (!s.staEnabled && !s.apEnabled) {
+    err = "At least one of STA or AP must be enabled.";
+    return false;
+  }
+
+  if (s.soilThreshold < 0.0f || s.soilThreshold > 100.0f) {
+    err = "Soil threshold must be 0-100.";
+    return false;
+  }
+
+  if (s.soilHysteresis < 0.0f || s.soilHysteresis > 100.0f) {
+    err = "Soil hysteresis must be 0-100.";
+    return false;
+  }
+
+  if (s.soilDryRaw < 0.0f || s.soilDryRaw > 4095.0f ||
+      s.soilWetRaw < 0.0f || s.soilWetRaw > 4095.0f) {
+    err = "Soil calibration raw values must be 0-4095.";
+    return false;
+  }
+
+  if (fabs(s.soilDryRaw - s.soilWetRaw) < 25.0f) {
+    err = "Soil dry and wet calibration raw values must differ by at least 25.";
+    return false;
+  }
+
+  if (s.tempThreshold < -40.0f || s.tempThreshold > 125.0f) {
+    err = "Temperature threshold must be -40 to 125 C.";
+    return false;
+  }
+
+  if (s.tempHysteresis < 0.0f || s.tempHysteresis > 125.0f) {
+    err = "Temperature hysteresis must be 0-125.";
+    return false;
+  }
+
+  if (s.humThreshold < 0.0f || s.humThreshold > 100.0f) {
+    err = "Humidity threshold must be 0-100.";
+    return false;
+  }
+
+  if (s.humHysteresis < 0.0f || s.humHysteresis > 100.0f) {
+    err = "Humidity hysteresis must be 0-100.";
+    return false;
+  }
+
+  if (s.sensorInterval < 1 || s.sensorInterval > 60) {
+    err = "Sensor interval must be 1-60 seconds.";
+    return false;
+  }
+
+  if (s.relayMinOnMs > 3600000UL || s.relayMinOffMs > 3600000UL) {
+    err = "Relay minimum on/off time must be <=3600000 ms.";
+    return false;
+  }
+
+  return true;
+}
+
+bool networkSettingsChanged(const Settings& a, const Settings& b) {
+  return a.hostname != b.hostname ||
+         a.staEnabled != b.staEnabled ||
+         a.staSsid != b.staSsid ||
+         a.staPass != b.staPass ||
+         a.apEnabled != b.apEnabled ||
+         a.apFallback != b.apFallback ||
+         a.apHidden != b.apHidden ||
+         a.apChannel != b.apChannel ||
+         a.apSsid != b.apSsid ||
+         a.apPass != b.apPass ||
+         a.apMaxClients != b.apMaxClients;
+}
+
+// -------------------- Sensor functions --------------------
+
+int readSoilRawAverage(int samples) {
+  if (samples < 1) {
+    samples = 1;
+  }
+
+  long sum = 0;
+  int count = 0;
+
+  for (int i = 0; i < samples; i++) {
+    int v = analogRead(SOIL_PIN);
+    if (v >= 0 && v <= 4095) {
+      sum += v;
+      count++;
+    }
+  }
+
+  if (count == 0) {
+    return -1;
+  }
+
+  return (int)((sum + count / 2) / count);
+}
+
+float rawToMoisture(float raw) {
+  float dry = settings.soilDryRaw;
+  float wet = settings.soilWetRaw;
+
+  if (!isfinite(dry) || !isfinite(wet)) {
+    return NAN;
+  }
+
+  if (fabs(dry - wet) < 25.0f) {
+    return NAN;
+  }
+
+  float pct = (raw - dry) * 100.0f / (wet - dry);
+
+  if (pct < 0.0f) {
+    pct = 0.0f;
+  }
+  if (pct > 100.0f) {
+    pct = 100.0f;
+  }
+
+  return pct;
+}
+
+bool beginSHT31() {
+  lastShtInitAttempt = millis();
+
+  uint8_t addrs[2] = { SHT31_ADDR_PRIMARY, SHT31_ADDR_ALT };
+
+  for (uint8_t i = 0; i < 2; i++) {
+    if (sht31.begin(addrs[i])) {
+      shtAddr = addrs[i];
+      sht31.setHeater(false);
+      shtReady = true;
+      shtFailCount = 0;
+      return true;
+    }
+  }
+
+  shtReady = false;
+  return false;
+}
+
+bool soilReadingFresh() {
+  if (!soilValid) {
+    return false;
+  }
+
+  unsigned long staleMs = (unsigned long)settings.sensorInterval * 3000UL;
+  if (staleMs < SENSOR_STALE_MIN_MS) {
+    staleMs = SENSOR_STALE_MIN_MS;
+  }
+
+  return (millis() - soilLastValidMs) <= staleMs;
+}
+
+bool shtReadingFresh() {
+  if (!shtValid) {
+    return false;
+  }
+
+  unsigned long staleMs = (unsigned long)settings.sensorInterval * 3000UL;
+  if (staleMs < SENSOR_STALE_MIN_MS) {
+    staleMs = SENSOR_STALE_MIN_MS;
+  }
+
+  return (millis() - shtLastValidMs) <= staleMs;
+}
+
+void readSensors(bool force) {
+  unsigned long now = millis();
+  unsigned long intervalMs = (unsigned long)settings.sensorInterval * 1000UL;
+
+  if (!force && (now - lastSensorReadMs) < intervalMs) {
+    return;
+  }
+
+  lastSensorReadMs = now;
+
+  // ----- Capacitive soil moisture -----
+  int raw = readSoilRawAverage(16);
+
+  if (raw >= 0) {
+    if (!soilValid || isnan(soilRawFiltered)) {
+      soilRawFiltered = (float)raw;
+    } else {
+      soilRawFiltered = soilRawFiltered * 0.70f + (float)raw * 0.30f;
+    }
+
+    float pct = rawToMoisture(soilRawFiltered);
+
+    if (isnan(pct)) {
+      soilPercent = NAN;
+      soilValid = false;
+    } else {
+      soilPercent = pct;
+      soilValid = true;
+      soilLastValidMs = now;
+    }
+  } else {
+    soilValid = false;
+    soilPercent = NAN;
+  }
+
+  // ----- SHT31 temperature / humidity -----
+  if (!shtReady) {
+    if (now - lastShtInitAttempt > SHT_RETRY_MS) {
+      beginSHT31();
+    }
+  }
+
+  if (shtReady) {
+    float t = sht31.readTemperature();
+    float h = sht31.readHumidity();
+
+    bool good = !isnan(t) && !isnan(h) &&
+                t >= -40.0f && t <= 125.0f &&
+                h >= 0.0f && h <= 100.0f;
+
+    if (good) {
+      if (shtValid) {
+        tempC = tempC * 0.70f + t * 0.30f;
+        humidity = humidity * 0.70f + h * 0.30f;
+      } else {
+        tempC = t;
+        humidity = h;
+      }
+
+      shtValid = true;
+      shtFailCount = 0;
+      shtLastValidMs = now;
+    } else {
+      if (shtFailCount < 255) {
+        shtFailCount++;
+      }
+
+      if (shtFailCount >= 3) {
+        shtValid = false;
+        shtReady = false;
+      }
+    }
+  }
+}
+
+bool applyBelowHysteresis(bool prev, float value, float threshold, float hysteresis) {
+  if (!isfinite(value)) {
+    return false;
+  }
+
+  if (hysteresis < 0.0f) {
+    hysteresis = 0.0f;
+  }
+
+  if (prev) {
+    return value <= (threshold + hysteresis);
+  }
+
+  return value <= threshold;
+}
+
+bool applyAboveHysteresis(bool prev, float value, float threshold, float hysteresis) {
+  if (!isfinite(value)) {
+    return false;
+  }
+
+  if (hysteresis < 0.0f) {
+    hysteresis = 0.0f;
+  }
+
+  if (prev) {
+    return value >= (threshold - hysteresis);
+  }
+
+  return value >= threshold;
+}
+
+void resetConditionHysteresis() {
+  soilActivePrev = false;
+  tempActivePrev = false;
+  humActivePrev = false;
+}
+
+AutoEval evaluateAuto() {
+  AutoEval e;
+  e.target = false;
+  e.fault = false;
+  e.soilActive = false;
+  e.tempActive = false;
+  e.humActive = false;
+  e.enabledCount = 0;
+  e.combineAny = settings.combineAny;
+  e.reason = "Auto OFF";
+
+  bool soilFresh = soilReadingFresh();
+  bool shtFresh = shtReadingFresh();
+
+  // Soil condition
+  if (settings.soilEnabled) {
+    e.enabledCount++;
+
+    if (!soilFresh) {
+      e.fault = true;
+      e.soilActive = false;
+      soilActivePrev = false;
+    } else {
+      e.soilActive = applyBelowHysteresis(
+        soilActivePrev,
+        soilPercent,
+        settings.soilThreshold,
+        settings.soilHysteresis
+      );
+      soilActivePrev = e.soilActive;
+    }
+  } else {
+    soilActivePrev = false;
+  }
+
+  // Temperature condition
+  if (settings.tempEnabled) {
+    e.enabledCount++;
+
+    if (!shtFresh) {
+      e.fault = true;
+      e.tempActive = false;
+      tempActivePrev = false;
+    } else {
+      e.tempActive = settings.tempTriggerAbove
+        ? applyAboveHysteresis(tempActivePrev, tempC, settings.tempThreshold, settings.tempHysteresis)
+        : applyBelowHysteresis(tempActivePrev, tempC, settings.tempThreshold, settings.tempHysteresis);
+      tempActivePrev = e.tempActive;
+    }
+  } else {
+    tempActivePrev = false;
+  }
+
+  // Humidity condition
+  if (settings.humEnabled) {
+    e.enabledCount++;
+
+    if (!shtFresh) {
+      e.fault = true;
+      e.humActive = false;
+      humActivePrev = false;
+    } else {
+      e.humActive = settings.humTriggerAbove
+        ? applyAboveHysteresis(humActivePrev, humidity, settings.humThreshold, settings.humHysteresis)
+        : applyBelowHysteresis(humActivePrev, humidity, settings.humThreshold, settings.humHysteresis);
+      humActivePrev = e.humActive;
+    }
+  } else {
+    humActivePrev = false;
+  }
+
+  bool anyActive = e.soilActive || e.tempActive || e.humActive;
+
+  bool allActive = true;
+  if (settings.soilEnabled) {
+    allActive = allActive && e.soilActive;
+  }
+  if (settings.tempEnabled) {
+    allActive = allActive && e.tempActive;
+  }
+  if (settings.humEnabled) {
+    allActive = allActive && e.humActive;
+  }
+
+  if (settings.failSafeOnSensorFault && e.fault) {
+    e.target = false;
+    e.reason = "Auto OFF: enabled sensor fault";
+    return e;
+  }
+
+  if (e.enabledCount == 0) {
+    e.target = false;
+    e.reason = "Auto OFF: no enabled sensor rule";
+    return e;
+  }
+
+  e.target = settings.combineAny ? anyActive : allActive;
+
+  bool faultIgnored = e.fault && !settings.failSafeOnSensorFault;
+  if (e.target) {
+    e.reason = faultIgnored
+      ? "Auto ON: condition met (sensor fault ignored)"
+      : "Auto ON: condition met";
+  } else {
+    e.reason = faultIgnored
+      ? "Auto OFF: condition not met (sensor fault ignored)"
+      : "Auto OFF: condition not met";
+  }
+
+  return e;
+}
+
+// -------------------- Relay functions --------------------
+
+void writeRelayOutput(bool on) {
+  int level = settings.relayActiveLow ? (on ? LOW : HIGH) : (on ? HIGH : LOW);
+  digitalWrite(RELAY_PIN, level);
+}
+
+void setRelay(bool on, const char* reason) {
+  bool changed = (relayState != on);
+
+  writeRelayOutput(on);
+  relayState = on;
+
+  if (changed) {
+    lastRelayChangeMs = millis();
+  }
+
+  relayReason = reason;
+}
+
+void serviceRelay() {
+  lastEval = evaluateAuto();
+
+  bool safetyFault = lastEval.fault && settings.failSafeOnSensorFault;
+
+  bool desired = false;
+  const char* reason = nullptr;
+
+  if (runtimeMode == MODE_ON) {
+    desired = true;
+    reason = "Manual ON";
+  } else if (runtimeMode == MODE_OFF) {
+    desired = false;
+    reason = "Manual OFF";
+  } else {
+    desired = lastEval.target;
+    reason = lastEval.reason;
+  }
+
+  if (runtimeMode == MODE_AUTO && safetyFault) {
+    if (relayState) {
+      setRelay(false, reason);
+    } else {
+      relayReason = reason;
+    }
+    return;
+  }
+
+  if (desired == relayState) {
+    relayReason = reason;
+    return;
+  }
+
+  unsigned long age = millis() - lastRelayChangeMs;
+
+  bool canSwitch = true;
+
+  if (runtimeMode == MODE_AUTO) {
+    if (desired && age < settings.relayMinOffMs) {
+      canSwitch = false;
+      reason = "Auto ON: minimum OFF time not elapsed";
+    }
+
+    if (!desired && age < settings.relayMinOnMs) {
+      canSwitch = false;
+      reason = "Auto OFF: minimum ON time not elapsed";
+    }
+  }
+
+  if (canSwitch) {
+    setRelay(desired, reason);
+  } else {
+    relayReason = reason;
+  }
+}
+
+// -------------------- Network functions --------------------
+
+void startDNS() {
+  lastDNSAttempt = millis();
+
+  if (!apActive) {
+    return;
+  }
+
+  IPAddress ip = WiFi.softAPIP();
+
+  if (ip == IPAddress(0, 0, 0, 0)) {
+    return;
+  }
+
+  if (dnsActive) {
+    dnsServer.stop();
+    dnsActive = false;
+  }
+
+  dnsActive = dnsServer.start(53, "*", ip);
+}
+
+void stopDNS() {
+  if (dnsActive) {
+    dnsServer.stop();
+    dnsActive = false;
+  }
+}
+
+String apRedirectUrl() {
+  IPAddress ip = WiFi.softAPIP();
+
+  if (ip == IPAddress(0, 0, 0, 0)) {
+    return "/";
+  }
+
+  String out = "http://";
+  out += ip.toString();
+  out += "/";
+  return out;
+}
+
+void stopMDNS() {
+  if (mdnsStarted) {
+    MDNS.end();
+    mdnsStarted = false;
+    lastMdnsHostname = "";
+    lastMdnsIp = IPAddress(0, 0, 0, 0);
+  }
+}
+
+void startMDNS() {
+  if (WiFi.getMode() == WIFI_OFF) {
+    stopMDNS();
+    return;
+  }
+
+  IPAddress ip(0, 0, 0, 0);
+
+  if (WiFi.status() == WL_CONNECTED) {
+    ip = WiFi.localIP();
+  } else if (apActive) {
+    ip = WiFi.softAPIP();
+  }
+
+  if (ip == IPAddress(0, 0, 0, 0)) {
+    stopMDNS();
+    return;
+  }
+
+  if (mdnsStarted &&
+      lastMdnsHostname == settings.hostname &&
+      lastMdnsIp == ip) {
+    return;
+  }
+
+  if (lastMdnsAttempt != 0 && (millis() - lastMdnsAttempt) < 5000UL) {
+    return;
+  }
+
+  lastMdnsAttempt = millis();
+
+  if (mdnsStarted) {
+    MDNS.end();
+    mdnsStarted = false;
+  }
+
+  if (MDNS.begin(settings.hostname.c_str())) {
+    MDNS.addService("http", "tcp", 80);
+    mdnsStarted = true;
+    lastMdnsHostname = settings.hostname;
+    lastMdnsIp = ip;
+  }
+}
+
+bool softAPStart() {
+  if (apActive) {
+    return true;
+  }
+
+  const char* apPassword = settings.apPass.length() > 0 ? settings.apPass.c_str() : nullptr;
+
+  bool ok = WiFi.softAP(
+    settings.apSsid.c_str(),
+    apPassword,
+    settings.apChannel,
+    settings.apHidden,
+    settings.apMaxClients
+  );
+
+  if (ok) {
+    apActive = true;
+
+    if (settings.captivePortal) {
+      startDNS();
+    }
+  }
+
+  return ok;
+}
+
+bool startAP() {
+  if (apActive) {
+    return true;
+  }
+
+  if (WiFi.getMode() != WIFI_AP_STA) {
+    WiFi.mode(WIFI_AP_STA);
+    delay(20);
+  }
+
+  return softAPStart();
+}
+
+void stopAP() {
+  stopDNS();
+
+  if (apActive) {
+    WiFi.softAPdisconnect(false);
+    apActive = false;
+  }
+
+  if (settings.staEnabled) {
+    if (WiFi.getMode() != WIFI_STA) {
+      WiFi.mode(WIFI_STA);
+    }
+  } else if (!settings.apEnabled) {
+    WiFi.mode(WIFI_OFF);
+  }
+
+  startMDNS();
+}
+
+void reconfigureNetwork() {
+  networkDirty = false;
+
+  stopDNS();
+  stopMDNS();
+
+  if (apActive) {
+    WiFi.softAPdisconnect(false);
+    apActive = false;
+  }
+
+  WiFi.disconnect(false, false);
+  delay(60);
+
+  bool wantAP = settings.apEnabled || (settings.staEnabled && settings.apFallback);
+
+  wifi_mode_t mode = WIFI_OFF;
+
+  if (settings.staEnabled && wantAP) {
+    mode = WIFI_AP_STA;
+  } else if (settings.staEnabled) {
+    mode = WIFI_STA;
+  } else if (wantAP) {
+    mode = WIFI_AP_STA;
+  }
+
+  WiFi.mode(mode);
+  delay(30);
+
+  WiFi.setHostname(settings.hostname.c_str());
+  WiFi.setAutoReconnect(settings.staEnabled);
+
+  if (!settings.staEnabled) {
+    WiFi.disconnect(false, false);
+  }
+
+  if (wantAP) {
+    lastAPAttempt = millis();
+    softAPStart();
+  }
+
+  if (settings.staEnabled) {
+    WiFi.begin(settings.staSsid.c_str(), settings.staPass.c_str());
+    lastStaAttempt = millis();
+  }
+
+  startMDNS();
+}
+
+void serviceNetwork() {
+  if (!settings.staEnabled) {
+    if (WiFi.status() == WL_CONNECTED) {
+      WiFi.disconnect(false, false);
+    }
+  } else {
+    if (WiFi.status() != WL_CONNECTED) {
+      if ((millis() - lastStaAttempt) > STA_RETRY_MS) {
+        WiFi.disconnect(false, false);
+        WiFi.begin(settings.staSsid.c_str(), settings.staPass.c_str());
+        lastStaAttempt = millis();
+      }
+    }
+  }
+
+  // AP / fallback AP management
+  bool fallbackNeeded = settings.staEnabled &&
+                        settings.apFallback &&
+                        (WiFi.status() != WL_CONNECTED);
+
+  bool shouldAP = settings.apEnabled || fallbackNeeded;
+
+  if (shouldAP) {
+    if (!apActive && (millis() - lastAPAttempt > AP_RETRY_MS)) {
+      lastAPAttempt = millis();
+      startAP();
+    }
+  } else {
+    if (apActive) {
+      stopAP();
+    }
+  }
+
+  // Captive portal DNS
+  if (apActive && settings.captivePortal) {
+    if (!dnsActive && (millis() - lastDNSAttempt > 1000UL)) {
+      startDNS();
+    }
+  } else {
+    if (dnsActive) {
+      stopDNS();
+    }
+  }
+
+  startMDNS();
+}
+
+// -------------------- Boot button / factory reset --------------------
+
+void doFactoryReset() {
+  setRelay(false, "Factory reset");
+  writeRelayOutput(false);
+
+  stopDNS();
+  stopMDNS();
+
+  if (apActive) {
+    WiFi.softAPdisconnect(false);
+    apActive = false;
+  }
+
+  WiFi.disconnect(true, true);
+  delay(120);
+
+  if (prefs.begin("envmon", false)) {
+    prefs.clear();
+    prefs.end();
+  }
+
+  delay(250);
+  ESP.restart();
+}
+
+void handleBootButton() {
+  bool down = (digitalRead(BOOT_BUTTON_PIN) == LOW);
+
+  if (down) {
+    if (!bootButtonDown) {
+      bootButtonDown = true;
+      bootButtonDownMs = millis();
+    }
+
+    if (!bootResetTriggered &&
+        (millis() - bootButtonDownMs >= BOOT_RESET_HOLD_MS)) {
+      bootResetTriggered = true;
+      setRelay(false, "Factory reset boot button");
+      delay(100);
+      doFactoryReset();
+    }
+  } else {
+    bootButtonDown = false;
+  }
+}
+
+// -------------------- Embedded dashboard --------------------
+
+const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!doctype html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ESP32 Garden Dashboard</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32 Sensor Relay Dashboard</title>
 <style>
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
-       background:#0f172a;color:#e2e8f0;min-height:100vh;padding:16px}
-  .container{max-width:900px;margin:0 auto}
-  h1{font-size:1.6rem;margin-bottom:8px;color:#38bdf8}
-  .sub{color:#94a3b8;font-size:.85rem;margin-bottom:20px}
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;margin-bottom:20px}
-  .card{background:#1e293b;border-radius:12px;padding:16px;border:1px solid #334155}
-  .card h3{font-size:.8rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px}
-  .value{font-size:2rem;font-weight:700;color:#38bdf8}
-  .unit{font-size:.9rem;color:#64748b;font-weight:400}
-  .status-dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px}
-  .dot-on{background:#22c55e;box-shadow:0 0 8px #22c55e}
-  .dot-off{background:#64748b}
-  .row{display:flex;justify-content:space-between;align-items:center;padding:6px 0;font-size:.9rem}
-  .row span:last-child{color:#38bdf8;font-weight:600}
-  .section{background:#1e293b;border-radius:12px;padding:18px;margin-bottom:16px;border:1px solid #334155}
-  .section h2{font-size:1.1rem;margin-bottom:14px;color:#f1f5f9}
-  label{display:block;font-size:.8rem;color:#94a3b8;margin:10px 0 4px}
-  input,select{width:100%;padding:9px 12px;border-radius:8px;border:1px solid #475569;
-       background:#0f172a;color:#e2e8f0;font-size:.9rem;outline:none}
-  input:focus,select:focus{border-color:#38bdf8}
-  button{background:#38bdf8;color:#0f172a;border:none;padding:11px 20px;border-radius:8px;
-       font-weight:700;font-size:.9rem;cursor:pointer;margin-top:14px;width:100%;transition:.2s}
-  button:hover{background:#0ea5e9}
-  button.danger{background:#ef4444;color:#fff}
-  button.danger:hover{background:#dc2626}
-  button.warn{background:#f59e0b;color:#0f172a}
-  button.warn:hover{background:#d97706}
-  .btn-row{display:flex;gap:10px;flex-wrap:wrap}
-  .btn-row button{flex:1;min-width:140px}
-  .toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);
-       background:#22c55e;color:#fff;padding:12px 24px;border-radius:8px;
-       font-weight:600;opacity:0;transition:.3s;z-index:999}
-  .toast.show{opacity:1}
-  .toast.err{background:#ef4444}
-  .badge{font-size:.7rem;padding:2px 8px;border-radius:20px;background:#334155;color:#94a3b8;margin-left:8px}
-  .badge.on{background:#22c55e33;color:#22c55e}
-  .badge.off{background:#64748b33;color:#94a3b8}
-  .badge.err{background:#ef444433;color:#ef4444}
-  .badge.warn{background:#f59e0b33;color:#f59e0b}
-  .tabs{display:flex;gap:6px;margin-bottom:16px;flex-wrap:wrap}
-  .tab{padding:8px 16px;border-radius:8px;background:#1e293b;border:1px solid #334155;
-       color:#94a3b8;cursor:pointer;font-size:.85rem;font-weight:600;transition:.2s}
-  .tab.active{background:#38bdf8;color:#0f172a;border-color:#38bdf8}
-  .tab-content{display:none}
-  .tab-content.active{display:block}
+:root{
+  color-scheme:dark;
+  --bg:#08111f;
+  --card:#101c31;
+  --card2:#0c1729;
+  --line:#26364f;
+  --text:#e5eefb;
+  --muted:#93a4bd;
+  --blue:#3b82f6;
+  --green:#22c55e;
+  --red:#ef4444;
+  --amber:#f59e0b;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  min-height:100vh;
+  background:radial-gradient(circle at top left,#14233f 0,var(--bg) 38%,#050b14 100%);
+  color:var(--text);
+  font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,Arial,sans-serif;
+}
+header{
+  max-width:1200px;
+  margin:0 auto;
+  padding:18px 16px 8px;
+  display:flex;
+  justify-content:space-between;
+  align-items:flex-start;
+  gap:12px;
+}
+h1{font-size:21px;margin:0 0 3px}
+h2{font-size:16px;margin:0 0 10px;color:#bfdbfe}
+h3{font-size:13px;margin:18px 0 8px;color:#93c5fd;text-transform:uppercase;letter-spacing:.06em}
+main{max-width:1200px;margin:0 auto;padding:0 16px 28px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(245px,1fr));gap:14px}
+.card{
+  background:linear-gradient(180deg,rgba(23,37,61,.92),rgba(10,21,38,.96));
+  border:1px solid var(--line);
+  border-radius:16px;
+  padding:14px;
+  margin-bottom:14px;
+  box-shadow:0 10px 30px rgba(0,0,0,.18);
+}
+.big{font-size:34px;line-height:1.1;font-weight:800;margin:4px 0}
+.small{font-size:12px}
+.muted{color:var(--muted)}
+.good{color:var(--green)}
+.bad{color:var(--red)}
+.on{color:var(--green)}
+.off{color:var(--muted)}
+.pill{
+  border:1px solid var(--line);
+  border-radius:999px;
+  padding:6px 11px;
+  font-weight:700;
+  font-size:13px;
+  white-space:nowrap;
+  background:rgba(15,23,42,.75);
+}
+.pill.good{border-color:rgba(34,197,94,.45);color:var(--green)}
+.pill.bad{border-color:rgba(239,68,68,.5);color:var(--red)}
+.msg{
+  margin:0 0 14px;
+  padding:10px 12px;
+  border-radius:12px;
+  border:1px solid var(--line);
+  background:rgba(15,23,42,.8);
+}
+.msg:empty{display:none}
+.msg.ok{border-color:rgba(34,197,94,.5);color:#bbf7d0}
+.msg.bad{border-color:rgba(239,68,68,.55);color:#fecaca}
+.msg.info{color:#dbeafe}
+.form-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(190px,1fr));
+  gap:10px;
+}
+label{
+  display:flex;
+  flex-direction:column;
+  gap:5px;
+  min-width:0;
+  color:#cbd5e1;
+  font-size:13px;
+}
+label.check{
+  flex-direction:row;
+  align-items:center;
+  gap:8px;
+  min-height:38px;
+}
+input,select,button{
+  font:inherit;
+}
+input,select{
+  width:100%;
+  min-width:0;
+  background:#0b1628;
+  color:var(--text);
+  border:1px solid #334155;
+  border-radius:10px;
+  padding:9px 10px;
+  outline:none;
+}
+input:focus,select:focus{border-color:var(--blue);box-shadow:0 0 0 2px rgba(59,130,246,.18)}
+label.check input{width:auto}
+button{
+  cursor:pointer;
+  border:1px solid #334155;
+  background:#1e293b;
+  color:var(--text);
+  border-radius:10px;
+  padding:9px 12px;
+  font-weight:700;
+  white-space:nowrap;
+}
+button:hover{border-color:#64748b}
+button.primary{background:#1d4ed8;border-color:#3b82f6}
+button.warn{background:#78350f;border-color:#f59e0b}
+button.danger{background:#7f1d1d;border-color:#ef4444}
+.btnrow{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+.scanList{
+  display:grid;
+  gap:6px;
+  margin-top:10px;
+  max-height:280px;
+  overflow:auto;
+}
+.scan-item{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  text-align:left;
+  gap:12px;
+  width:100%;
+}
+.scan-item span:last-child{color:var(--muted);font-size:12px}
+.hr{height:1px;background:var(--line);margin:14px 0}
+@media (max-width:560px){
+  header{flex-direction:column}
+  .big{font-size:30px}
+}
 </style>
 </head>
 <body>
-<div class="container">
-  <h1>🌱 ESP32 Garden Control</h1>
-  <p class="sub" id="devname">Loading…</p>
+<header>
+  <div>
+    <h1>ESP32 Environmental Relay</h1>
+    <div class="muted small">Soil moisture + SHT31 + GPIO25 relay + WiFi management</div>
+  </div>
+  <div id="connPill" class="pill bad">Connecting...</div>
+</header>
 
-  <div class="grid">
-    <div class="card"><h3>Soil Moisture</h3>
-      <div class="value"><span id="soil">--</span><span class="unit"> %</span></div>
-      <div class="row"><span>Raw ADC</span><span id="soilRaw">--</span></div>
-    </div>
-    <div class="card"><h3>Temperature</h3>
-      <div class="value"><span id="temp">--</span><span class="unit"> °C</span></div>
-    </div>
-    <div class="card"><h3>Humidity</h3>
-      <div class="value"><span id="hum">--</span><span class="unit"> %</span></div>
-    </div>
-    <div class="card"><h3>Relay</h3>
-      <div class="value" style="font-size:1.5rem">
-        <span class="status-dot" id="relayDot"></span><span id="relayTxt">--</span>
+<main>
+  <div id="msg" class="msg"></div>
+
+  <section class="grid">
+    <div class="card">
+      <h2>Relay GPIO25</h2>
+      <div id="relayState" class="big off">--</div>
+      <div class="muted small">Reason: <span id="relayReason">--</span></div>
+      <div class="btnrow">
+        <button type="button" onclick="setMode('auto')">Auto</button>
+        <button type="button" onclick="setMode('off')">Manual Off</button>
+        <button type="button" onclick="setMode('on')">Manual On</button>
       </div>
-      <div class="row"><span>Manual Override</span><span id="ovrTxt">—</span></div>
-    </div>
-  </div>
-
-  <div class="section">
-    <h2>System Status</h2>
-    <div class="row"><span>WiFi Mode</span><span id="wifiMode">--</span></div>
-    <div class="row"><span>AP IP</span><span id="apIp">--</span></div>
-    <div class="row"><span>STA IP</span><span id="staIp">--</span></div>
-    <div class="row"><span>STA Connected</span><span id="staConn">--</span></div>
-    <div class="row"><span>SHT31</span><span id="shtOK">--</span></div>
-    <div class="row"><span>Uptime</span><span id="uptime">--</span></div>
-    <div class="row"><span>Free Heap</span><span id="heap">--</span></div>
-  </div>
-
-  <div class="tabs">
-    <div class="tab active" data-tab="wifi">WiFi</div>
-    <div class="tab" data-tab="thresholds">Thresholds</div>
-    <div class="tab" data-tab="relay">Relay</div>
-    <div class="tab" data-tab="system">System</div>
-  </div>
-
-  <div class="tab-content active" id="tab-wifi">
-    <div class="section">
-      <h2>WiFi Station Settings</h2>
-      <label>SSID</label>
-      <input type="text" id="staSSID" maxlength="32" placeholder="Network name">
-      <label>Password (leave blank to keep current)</label>
-      <input type="password" id="staPass" maxlength="63" placeholder="••••••••">
-      <label>Use STA Mode</label>
-      <select id="useSTA">
-        <option value="0">No (AP only)</option>
-        <option value="1">Yes (AP + STA)</option>
-      </select>
-      <div class="btn-row"><button onclick="saveWifi()">Save & Reconnect</button></div>
-    </div>
-  </div>
-
-  <div class="tab-content" id="tab-thresholds">
-    <div class="section">
-      <h2>Soil Moisture Thresholds</h2>
-      <label>Dry Calibration (raw ADC, higher = drier)</label>
-      <input type="number" id="soilDryRaw" min="0" max="4095">
-      <label>Wet Calibration (raw ADC, lower = wetter)</label>
-      <input type="number" id="soilWetRaw" min="0" max="4095">
-      <label>Relay triggers below this moisture (%)</label>
-      <input type="number" id="soilThresholdPct" min="0" max="100">
-    </div>
-    <div class="section">
-      <h2>SHT31 Thresholds</h2>
-      <label>Temperature High (°C)</label><input type="number" step="0.1" id="tempHighC">
-      <label>Temperature Low (°C)</label>  <input type="number" step="0.1" id="tempLowC">
-      <label>Humidity High (%)</label>     <input type="number" step="0.1" id="humHighPct">
-      <label>Humidity Low (%)</label>      <input type="number" step="0.1" id="humLowPct">
-    </div>
-    <button onclick="saveThresholds()">Save Thresholds</button>
-  </div>
-
-  <div class="tab-content" id="tab-relay">
-    <div class="section">
-      <h2>Relay Logic</h2>
-      <label>Trigger Mode</label>
-      <select id="relayMode">
-        <option value="0">Soil moisture only</option>
-        <option value="1">Temperature only</option>
-        <option value="2">Humidity only</option>
-        <option value="3">Soil OR Temp OR Humidity</option>
-        <option value="4">Soil AND Temp AND Humidity</option>
-      </select>
-      <label>Relay Active Level</label>
-      <select id="relayActiveLow">
-        <option value="1">Active LOW (most modules)</option>
-        <option value="0">Active HIGH</option>
-      </select>
-      <div class="row" style="margin-top:16px"><span>Current State</span><span id="relayManual">--</span></div>
-      <div class="btn-row">
-        <button class="warn" onclick="manualToggle()">Manual Toggle (5 min)</button>
-        <button onclick="clearOverride()">Clear Override</button>
+      <div class="muted small" style="margin-top:8px">
+        Mode: <span id="controlMode">--</span> &middot; Last change: <span id="relayAge">--</span>
       </div>
     </div>
-    <button onclick="saveRelay()">Save Relay Settings</button>
-  </div>
 
-  <div class="tab-content" id="tab-system">
-    <div class="section">
-      <h2>Device</h2>
-      <label>Device Name</label><input type="text" id="deviceName">
-      <button onclick="saveDevice()">Save Device Name</button>
+    <div class="card">
+      <h2>Soil Moisture</h2>
+      <div class="big"><span id="soilPct">--</span><span class="muted">%</span></div>
+      <div class="small">Raw: <span id="soilRaw">--</span> &middot; Threshold: <span id="soilThresholdView">--</span>%</div>
+      <div class="small">Sensor: <span id="soilValid">--</span> &middot; Rule: <span id="soilActive">--</span></div>
     </div>
-    <div class="section">
-      <h2>Danger Zone</h2>
-      <p style="font-size:.85rem;color:#94a3b8;margin-bottom:10px">
-        Erase all settings and reboot the device.
-      </p>
-      <button class="danger" onclick="factoryReset()">Factory Reset</button>
+
+    <div class="card">
+      <h2>SHT31</h2>
+      <div class="big"><span id="tempC">--</span><span class="muted">&deg;C</span></div>
+      <div class="small">Humidity: <span id="humPct">--</span>%</div>
+      <div class="small">Sensor: <span id="shtValid">--</span></div>
+      <div class="small">Temp rule: <span id="tempActive">--</span> &middot; Humidity rule: <span id="humActive">--</span></div>
     </div>
-  </div>
-</div>
-<div class="toast" id="toast"></div>
+
+    <div class="card">
+      <h2>Network</h2>
+      <div class="small">STA: <span id="staStatus">--</span> <span id="staSsidView">--</span></div>
+      <div class="small">STA IP: <span id="staIp">--</span> &middot; RSSI: <span id="staRssi">--</span></div>
+      <div class="small">AP: <span id="apStatus">--</span> <span id="apSsidView">--</span> &middot; clients: <span id="apClients">--</span></div>
+      <div class="small">AP IP: <span id="apIp">--</span></div>
+      <div class="small">Captive portal: <span id="portalStatus">--</span></div>
+      <div class="small muted" style="margin-top:8px">
+        Uptime: <span id="uptime">--</span> &middot; Free heap: <span id="heap">--</span> bytes
+      </div>
+    </div>
+  </section>
+
+  <form id="settingsForm">
+    <section class="card">
+      <h2>Automatic Relay Rules</h2>
+      <div class="form-grid">
+        <label>Combine enabled conditions
+          <select name="combine" id="combine">
+            <option value="all">ALL enabled conditions must be true</option>
+            <option value="any">ANY enabled condition may be true</option>
+          </select>
+        </label>
+        <label class="check">
+          <input type="checkbox" name="failSafeOnSensorFault" id="failSafeOnSensorFault">
+          Fail-safe OFF if an enabled sensor is invalid
+        </label>
+      </div>
+
+      <h3>Soil Moisture Rule</h3>
+      <div class="form-grid">
+        <label class="check">
+          <input type="checkbox" name="soilEnabled" id="soilEnabled">
+          Enable soil rule
+        </label>
+        <label>Dry threshold (%)
+          <input type="number" step="0.1" min="0" max="100" name="soilThreshold" id="soilThreshold">
+        </label>
+        <label>Hysteresis (%)
+          <input type="number" step="0.1" min="0" max="100" name="soilHysteresis" id="soilHysteresis">
+        </label>
+        <label>Dry calibration raw
+          <input type="number" step="1" min="0" max="4095" name="soilDryRaw" id="soilDryRaw">
+        </label>
+        <label>Wet calibration raw
+          <input type="number" step="1" min="0" max="4095" name="soilWetRaw" id="soilWetRaw">
+        </label>
+        <div class="btnrow">
+          <button type="button" onclick="calibrateSoil('dry')">Calibrate Dry Now</button>
+          <button type="button" onclick="calibrateSoil('wet')">Calibrate Wet Now</button>
+        </div>
+      </div>
+      <p class="muted small">Soil rule becomes active at moisture &lt;= threshold. It clears at moisture &gt;= threshold + hysteresis.</p>
+
+      <h3>SHT31 Temperature Rule</h3>
+      <div class="form-grid">
+        <label class="check">
+          <input type="checkbox" name="tempEnabled" id="tempEnabled">
+          Enable temperature rule
+        </label>
+        <label>Threshold (&deg;C)
+          <input type="number" step="0.1" min="-40" max="125" name="tempThreshold" id="tempThreshold">
+        </label>
+        <label>Hysteresis (&deg;C)
+          <input type="number" step="0.1" min="0" max="125" name="tempHysteresis" id="tempHysteresis">
+        </label>
+        <label>Trigger direction
+          <select name="tempDirection" id="tempDirection">
+            <option value="above">Above threshold</option>
+            <option value="below">Below threshold</option>
+          </select>
+        </label>
+      </div>
+
+      <h3>SHT31 Humidity Rule</h3>
+      <div class="form-grid">
+        <label class="check">
+          <input type="checkbox" name="humEnabled" id="humEnabled">
+          Enable humidity rule
+        </label>
+        <label>Threshold (%RH)
+          <input type="number" step="0.1" min="0" max="100" name="humThreshold" id="humThreshold">
+        </label>
+        <label>Hysteresis (%RH)
+          <input type="number" step="0.1" min="0" max="100" name="humHysteresis" id="humHysteresis">
+        </label>
+        <label>Trigger direction
+          <select name="humDirection" id="humDirection">
+            <option value="above">Above threshold</option>
+            <option value="below">Below threshold</option>
+          </select>
+        </label>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Relay Hardware &amp; Sampling</h2>
+      <div class="form-grid">
+        <label class="check">
+          <input type="checkbox" name="relayActiveLow" id="relayActiveLow">
+          Relay is active LOW
+        </label>
+        <label>Minimum ON time (ms)
+          <input type="number" min="0" max="3600000" step="100" name="relayMinOnMs" id="relayMinOnMs">
+        </label>
+        <label>Minimum OFF time (ms)
+          <input type="number" min="0" max="3600000" step="100" name="relayMinOffMs" id="relayMinOffMs">
+        </label>
+        <label>Sensor sample interval (seconds)
+          <input type="number" min="1" max="60" step="1" name="sensorInterval" id="sensorInterval">
+        </label>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Wi-Fi Station (STA)</h2>
+      <div class="form-grid">
+        <label class="check">
+          <input type="checkbox" name="staEnabled" id="staEnabled">
+          Enable station connection
+        </label>
+        <label>SSID
+          <input type="text" maxlength="32" name="staSsid" id="staSsid" autocomplete="off">
+        </label>
+        <label>Password
+          <input type="password" maxlength="63" name="staPass" id="staPass" autocomplete="new-password">
+        </label>
+        <div class="btnrow">
+          <button type="button" onclick="forgetSta()">Forget STA</button>
+        </div>
+      </div>
+      <p class="muted small">Leave password empty for an open network. Use the WiFi scan section below to fill an SSID.</p>
+
+      <h3>Access Point (AP)</h3>
+      <div class="form-grid">
+        <label class="check">
+          <input type="checkbox" name="apEnabled" id="apEnabled">
+          Always enable AP
+        </label>
+        <label class="check">
+          <input type="checkbox" name="apFallback" id="apFallback">
+          Fallback AP when STA is disconnected
+        </label>
+        <label class="check">
+          <input type="checkbox" name="captivePortal" id="captivePortal">
+          Enable captive portal DNS
+        </label>
+        <label class="check">
+          <input type="checkbox" name="apHidden" id="apHidden">
+          Hidden AP
+        </label>
+        <label>AP SSID
+          <input type="text" maxlength="32" name="apSsid" id="apSsid">
+        </label>
+        <label>AP password
+          <input type="password" maxlength="63" name="apPass" id="apPass" autocomplete="new-password">
+        </label>
+        <label>AP channel
+          <input type="number" min="1" max="13" name="apChannel" id="apChannel">
+        </label>
+        <label>AP max clients
+          <input type="number" min="1" max="4" name="apMaxClients" id="apMaxClients">
+        </label>
+      </div>
+      <p class="muted small">AP password empty = open. Otherwise use 8-63 characters.</p>
+
+      <h3>System</h3>
+      <div class="form-grid">
+        <label>Hostname
+          <input type="text" maxlength="32" name="hostname" id="hostname">
+        </label>
+      </div>
+    </section>
+
+    <div class="btnrow">
+      <button type="submit" class="primary">Save &amp; Apply</button>
+      <button type="button" onclick="loadSettings()">Reload from Device</button>
+    </div>
+  </form>
+
+  <section class="card">
+    <h2>Wi-Fi Scan &amp; Connect</h2>
+    <p class="muted small">Scan station networks, click one to fill the STA SSID, enter its password, then press Save &amp; Apply.</p>
+    <button type="button" onclick="scanWifi()">Scan WiFi</button>
+    <div id="scanList" class="scanList"></div>
+  </section>
+
+  <section class="card">
+    <h2>Danger Zone</h2>
+    <div class="btnrow">
+      <button type="button" class="warn" onclick="rebootDevice()">Reboot</button>
+      <button type="button" class="danger" onclick="factoryResetDevice()">Factory Reset</button>
+    </div>
+    <p class="muted small">Factory reset clears stored app settings and Wi-Fi credentials. Holding GPIO0 LOW for 5 seconds also performs a factory reset.</p>
+  </section>
+</main>
 
 <script>
-function $(id){return document.getElementById(id)}
-function toast(msg, err){
-  var t=$('toast'); t.textContent=msg;
-  t.className='toast show'+(err?' err':'');
-  clearTimeout(t._tid); t._tid=setTimeout(function(){t.className='toast'},2500);
-}
-function fmt(v,d){return (v===null||v===undefined||isNaN(v))?'--':Number(v).toFixed(d===undefined?1:d)}
+const $ = id => document.getElementById(id);
+const boolKeys = [
+  'staEnabled','apEnabled','apFallback','captivePortal','apHidden',
+  'relayActiveLow','failSafeOnSensorFault','soilEnabled','tempEnabled','humEnabled'
+];
+const textKeys = ['hostname','staSsid','staPass','apSsid','apPass'];
+const numKeys = [
+  'apChannel','apMaxClients','relayMinOnMs','relayMinOffMs','sensorInterval',
+  'soilThreshold','soilHysteresis','soilDryRaw','soilWetRaw',
+  'tempThreshold','tempHysteresis','humThreshold','humHysteresis'
+];
 
-document.querySelectorAll('.tab').forEach(function(tab){
-  tab.addEventListener('click',function(){
-    document.querySelectorAll('.tab').forEach(function(t){t.classList.remove('active')});
-    document.querySelectorAll('.tab-content').forEach(function(c){c.classList.remove('active')});
-    tab.classList.add('active');
-    $('tab-'+tab.dataset.tab).classList.add('active');
-  });
+let msgTimer = null;
+let statusBusy = false;
+
+function showMsg(text, type) {
+  const el = $('msg');
+  el.textContent = text;
+  el.className = 'msg ' + (type || 'info');
+  clearTimeout(msgTimer);
+  msgTimer = setTimeout(() => {
+    el.textContent = '';
+    el.className = 'msg';
+  }, 6500);
+}
+
+function setConn(online) {
+  const el = $('connPill');
+  el.textContent = online ? 'Online' : 'Offline';
+  el.className = 'pill ' + (online ? 'good' : 'bad');
+}
+
+function fmt(v, digits) {
+  if (v === null || v === undefined) return '--';
+  const n = Number(v);
+  if (!Number.isFinite(n)) return '--';
+  return n.toFixed(digits === undefined ? 1 : digits);
+}
+
+function formatDuration(totalSeconds) {
+  totalSeconds = Math.max(0, Number(totalSeconds || 0));
+  const h = Math.floor(totalSeconds / 3600);
+  const m = Math.floor((totalSeconds % 3600) / 60);
+  const s = Math.floor(totalSeconds % 60);
+  return (h ? h + 'h ' : '') + (m ? m + 'm ' : '') + s + 's';
+}
+
+function setBadge(id, value, trueText, falseText, falseIsBad) {
+  const el = $(id);
+  if (!el) return;
+  el.textContent = value ? trueText : falseText;
+  el.className = value ? 'good' : (falseIsBad ? 'bad' : 'muted');
+}
+
+async function fetchJson(url, options, timeoutMs) {
+  options = options || {};
+  timeoutMs = timeoutMs || 15000;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+      cache: 'no-store'
+    });
+
+    const text = await res.text();
+    let data = {};
+
+    if (text) {
+      try {
+        data = JSON.parse(text);
+      } catch (e) {
+        data = { raw: text };
+      }
+    }
+
+    if (!res.ok) {
+      throw new Error(data.error || ('HTTP ' + res.status));
+    }
+
+    return data;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function loadSettings(silent) {
+  try {
+    const d = await fetchJson('/api/settings', {}, 9000);
+
+    for (const k of boolKeys) {
+      const el = $(k);
+      if (el) el.checked = !!d[k];
+    }
+
+    for (const k of textKeys.concat(numKeys)) {
+      const el = $(k);
+      if (el) el.value = (d[k] === undefined || d[k] === null) ? '' : d[k];
+    }
+
+    $('combine').value = d.combineAny ? 'any' : 'all';
+    $('tempDirection').value = d.tempTriggerAbove ? 'above' : 'below';
+    $('humDirection').value = d.humTriggerAbove ? 'above' : 'below';
+
+    if (!silent) {
+      showMsg('Settings loaded from device.', 'ok');
+    }
+  } catch (e) {
+    if (!silent) {
+      showMsg('Could not load settings: ' + e.message, 'bad');
+    }
+  }
+}
+
+async function pollStatus() {
+  if (statusBusy) return;
+  statusBusy = true;
+
+  try {
+    const d = await fetchJson('/api/status', {}, 6000);
+    setConn(true);
+
+    const relayOn = !!d.control.relayOn;
+    $('relayState').textContent = relayOn ? 'ON' : 'OFF';
+    $('relayState').className = 'big ' + (relayOn ? 'on' : 'off');
+
+    $('relayReason').textContent = d.control.reason || '--';
+    $('controlMode').textContent = (d.control.mode || '--').toUpperCase();
+    $('relayAge').textContent = formatDuration(d.control.ageSec || 0);
+
+    $('soilPct').textContent = fmt(d.soil.percent, 1);
+    $('soilRaw').textContent = fmt(d.soil.raw, 0);
+    $('soilThresholdView').textContent = fmt(d.soil.threshold, 1);
+    setBadge('soilValid', !!d.soil.valid, 'valid', 'invalid', true);
+    setBadge('soilActive', !!d.soil.active, 'active', 'idle', false);
+
+    $('tempC').textContent = fmt(d.sht31.tempC, 2);
+    $('humPct').textContent = fmt(d.sht31.humidity, 2);
+    setBadge('shtValid', !!d.sht31.valid, 'valid', 'invalid', true);
+    setBadge('tempActive', !!d.auto.tempActive, 'active', 'idle', false);
+    setBadge('humActive', !!d.auto.humActive, 'active', 'idle', false);
+
+    $('staStatus').textContent = d.wifi.staConnected
+      ? 'connected'
+      : (d.wifi.staEnabled ? d.wifi.staStatus : 'disabled');
+
+    $('staSsidView').textContent = d.wifi.staSsid || '--';
+    $('staIp').textContent = d.wifi.localIp || '--';
+    $('staRssi').textContent = d.wifi.staConnected ? ((d.wifi.rssi || 0) + ' dBm') : '--';
+
+    $('apStatus').textContent = d.wifi.apActive ? 'active' : 'off';
+    $('apSsidView').textContent = d.wifi.apSsid || '--';
+    $('apIp').textContent = d.wifi.apIp || '--';
+    $('apClients').textContent = d.wifi.apActive ? d.wifi.apClients : '--';
+
+    $('portalStatus').textContent = d.wifi.captivePortal
+      ? (d.wifi.dnsActive ? 'DNS running' : 'enabled')
+      : 'disabled';
+
+    $('uptime').textContent = formatDuration(d.uptime || 0);
+    $('heap').textContent = d.freeHeap || 0;
+  } catch (e) {
+    setConn(false);
+  } finally {
+    statusBusy = false;
+  }
+}
+
+async function setMode(mode) {
+  try {
+    const body = new URLSearchParams();
+    body.append('mode', mode);
+
+    await fetchJson('/api/control', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body
+    }, 8000);
+
+    showMsg('Control mode set to ' + mode.toUpperCase() + '.', 'ok');
+    await pollStatus();
+  } catch (e) {
+    showMsg('Control failed: ' + e.message, 'bad');
+  }
+}
+
+async function calibrateSoil(type) {
+  if (!confirm('Use the current raw soil reading as the ' + type.toUpperCase() + ' calibration point?')) {
+    return;
+  }
+
+  try {
+    const body = new URLSearchParams();
+    body.append('type', type);
+
+    const d = await fetchJson('/api/calibrate-soil', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body
+    }, 12000);
+
+    showMsg('Calibration captured: ' + type + ' raw = ' + d.raw, 'ok');
+    await loadSettings(true);
+    await pollStatus();
+  } catch (e) {
+    showMsg('Calibration failed: ' + e.message, 'bad');
+  }
+}
+
+async function forgetSta() {
+  if (!confirm('Remove the stored station SSID/password and disable STA? AP will be enabled if needed.')) {
+    return;
+  }
+
+  try {
+    await fetchJson('/api/forget-sta', {
+      method: 'POST'
+    }, 10000);
+
+    showMsg('STA credentials cleared.', 'ok');
+    await loadSettings(true);
+    await pollStatus();
+  } catch (e) {
+    showMsg('Forget STA failed: ' + e.message, 'bad');
+  }
+}
+
+async function scanWifi() {
+  const list = $('scanList');
+  list.textContent = 'Scanning...';
+
+  try {
+    const d = await fetchJson('/api/scan', {}, 25000);
+    const nets = (d.networks || []).sort((a, b) => (b.rssi || -999) - (a.rssi || -999));
+
+    list.innerHTML = '';
+
+    if (nets.length === 0) {
+      list.textContent = 'No networks found.';
+      return;
+    }
+
+    for (const n of nets) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'scan-item';
+
+      const ssid = document.createElement('span');
+      ssid.textContent = n.ssid || '(hidden)';
+
+      const rssi = document.createElement('span');
+      rssi.textContent = (n.rssi || 0) + ' dBm';
+
+      btn.appendChild(ssid);
+      btn.appendChild(rssi);
+
+      btn.addEventListener('click', () => {
+        $('staSsid').value = n.ssid || '';
+        $('staPass').value = '';
+        $('staEnabled').checked = true;
+        $('staPass').focus();
+        showMsg('SSID filled. Enter password and press Save & Apply.', 'info');
+      });
+
+      list.appendChild(btn);
+    }
+  } catch (e) {
+    list.textContent = 'Scan failed: ' + e.message;
+  }
+}
+
+async function rebootDevice() {
+  if (!confirm('Reboot the ESP32 now?')) {
+    return;
+  }
+
+  showMsg('Rebooting...', 'info');
+  try {
+    await fetchJson('/api/reboot', { method: 'POST' }, 6000);
+  } catch (e) {
+
+  }
+  setTimeout(() => setConn(false), 800);
+}
+
+async function factoryResetDevice() {
+  if (!confirm('Factory reset will clear settings and Wi-Fi credentials. Continue?')) {
+    return;
+  }
+
+  const answer = prompt('Type RESET to confirm factory reset:');
+  if (answer !== 'RESET') {
+    showMsg('Factory reset cancelled.', 'info');
+    return;
+  }
+
+  showMsg('Factory reset requested...', 'info');
+  try {
+    await fetchJson('/api/factory-reset', { method: 'POST' }, 6000);
+  } catch (e) {
+
+  }
+  setTimeout(() => setConn(false), 800);
+}
+
+$('settingsForm').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+
+  const fd = new FormData(ev.target);
+  const body = new URLSearchParams();
+
+  for (const [k, v] of fd.entries()) {
+    body.append(k, v);
+  }
+
+  try {
+    const d = await fetchJson('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body
+    }, 20000);
+
+    if (d.networkReconfig) {
+      showMsg('Settings saved. Network is reconfiguring; reconnect if the connection drops.', 'ok');
+    } else {
+      showMsg('Settings saved and applied.', 'ok');
+    }
+
+    await pollStatus();
+    setTimeout(() => { loadSettings(true).catch(() => {}); }, 1400);
+  } catch (e) {
+    showMsg('Save failed: ' + e.message, 'bad');
+  }
 });
 
-function refresh(){
-  fetch('/api/status').then(function(r){return r.json()}).then(function(d){
-    $('devname').textContent = d.deviceName + ' — ' + d.apIp;
-    $('soil').textContent = fmt(d.soilPct,1);
-    $('soilRaw').textContent = d.soilRaw;
-    $('temp').textContent = d.shtFresh ? fmt(d.temperature,1) : '--';
-    $('hum').textContent  = d.shtFresh ? fmt(d.humidity,1)   : '--';
-    $('relayDot').className='status-dot '+(d.relayState?'dot-on':'dot-off');
-    $('relayTxt').textContent  = d.relayState?'ON':'OFF';
-    $('relayManual').textContent = d.relayState?'ON':'OFF';
-    $('ovrTxt').textContent = d.manualOverride ? ('YES ('+d.manualRemainS+'s)') : 'no';
-    $('wifiMode').textContent = 'AP + STA';
-    $('apIp').textContent   = d.apIp;
-    $('staIp').textContent  = d.staIp || '--';
-    $('staConn').innerHTML  = d.staConnected ? '<span class="badge on">Connected</span>'
-                                             : '<span class="badge off">Disconnected</span>';
-    $('shtOK').innerHTML    = d.shtOK ? '<span class="badge on">OK</span>'
-                                      : '<span class="badge err">Error</span>';
-    $('uptime').textContent = d.uptime;
-    $('heap').textContent   = d.freeHeap + ' bytes';
-  }).catch(function(){});
-}
-setInterval(refresh, 2000); refresh();
-
-function loadSettings(retry){
-  retry = retry || 0;
-  fetch('/api/settings').then(function(r){return r.json()}).then(function(d){
-    $('staSSID').value = d.staSSID || '';
-    $('staPass').value = '';
-    $('useSTA').value  = d.useSTA ? '1' : '0';
-    $('soilDryRaw').value = d.soilDryRaw;
-    $('soilWetRaw').value = d.soilWetRaw;
-    $('soilThresholdPct').value = d.soilThresholdPct;
-    $('tempHighC').value = d.tempHighC;
-    $('tempLowC').value  = d.tempLowC;
-    $('humHighPct').value= d.humHighPct;
-    $('humLowPct').value = d.humLowPct;
-    $('relayMode').value = d.relayMode;
-    $('relayActiveLow').value = d.relayActiveLow ? '1' : '0';
-    $('deviceName').value = d.deviceName || '';
-  }).catch(function(){
-    if(retry < 3) setTimeout(function(){ loadSettings(retry+1); }, 1000);
-    else toast('Failed to load settings', true);
-  });
-}
-loadSettings();
-
-function postJSON(url, body, cb){
-  fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},
-             body:JSON.stringify(body)})
-   .then(function(r){return r.json()})
-   .then(function(d){ if(cb)cb(d); })
-   .catch(function(e){ toast('Error: '+e, true); });
-}
-
-function saveWifi(){
-  var body = {
-    staSSID: $('staSSID').value,
-    useSTA:  $('useSTA').value === '1'
-  };
-  var p = $('staPass').value;
-  if(p.length > 0) body.staPass = p;
-  postJSON('/api/settings', body, function(){
-    toast('WiFi saved — reconnecting…');
-    $('staPass').value='';
-    setTimeout(refresh, 3000);
-  });
-}
-function numOrNull(el){
-  var v = el.value.trim();
-  if(v === '') return null;
-  var n = Number(v);
-  return isNaN(n) ? null : n;
-}
-function saveThresholds(){
-  var body = {}, v;
-  if((v=numOrNull($('soilDryRaw')))       !== null) body.soilDryRaw = v;
-  if((v=numOrNull($('soilWetRaw')))       !== null) body.soilWetRaw = v;
-  if((v=numOrNull($('soilThresholdPct'))) !== null) body.soilThresholdPct = v;
-  if((v=numOrNull($('tempHighC')))        !== null) body.tempHighC = v;
-  if((v=numOrNull($('tempLowC')))         !== null) body.tempLowC = v;
-  if((v=numOrNull($('humHighPct')))       !== null) body.humHighPct = v;
-  if((v=numOrNull($('humLowPct')))        !== null) body.humLowPct = v;
-  if(Object.keys(body).length === 0){ toast('Nothing to save', true); return; }
-  postJSON('/api/settings', body, function(){ toast('Thresholds saved'); });
-}
-function saveRelay(){
-  var body = { relayActiveLow: $('relayActiveLow').value === '1' };
-  var m = numOrNull($('relayMode'));
-  if(m !== null) body.relayMode = m;
-  postJSON('/api/settings', body, function(){ toast('Relay settings saved'); });
-}
-function saveDevice(){
-  postJSON('/api/settings', {deviceName: $('deviceName').value},
-           function(){ toast('Device name saved'); });
-}
-function manualToggle(){
-  fetch('/api/relay/toggle',{method:'POST'})
-   .then(function(r){return r.json()})
-   .then(function(d){ toast('Manual override: '+(d.relayState?'ON':'OFF'));
-                      refresh(); });
-}
-function clearOverride(){
-  fetch('/api/relay/clear',{method:'POST'})
-   .then(function(){ toast('Override cleared'); refresh(); });
-}
-function factoryReset(){
-  if(!confirm('Factory reset erases ALL settings and reboots. Continue?')) return;
-  fetch('/api/factory-reset',{method:'POST'}).catch(function(){});
-  toast('Factory reset in progress…');
-}
+loadSettings(false);
+pollStatus();
+setInterval(pollStatus, 2500);
 </script>
 </body>
 </html>
-)HTML";
+)rawliteral";
 
-// ================= SETTINGS =================
-void loadSettings(){
-    prefs.begin("cfg", true);
-    cfg.staSSID           = prefs.getString("staSSID", "");
-    cfg.staPass           = prefs.getString("staPass", "");
-    cfg.useSTA            = prefs.getBool("useSTA", false);
-    cfg.soilDryRaw        = prefs.getInt("soilDryRaw", 3200);
-    cfg.soilWetRaw        = prefs.getInt("soilWetRaw", 1200);
-    cfg.soilThresholdPct  = prefs.getInt("soilThr", 30);
-    cfg.tempHighC         = prefs.getFloat("tHigh", 30.0f);
-    cfg.tempLowC          = prefs.getFloat("tLow", 10.0f);
-    cfg.humHighPct        = prefs.getFloat("hHigh", 80.0f);
-    cfg.humLowPct         = prefs.getFloat("hLow", 30.0f);
-    cfg.relayMode         = prefs.getInt("relayMode", 0);
-    cfg.relayActiveLow    = prefs.getBool("rActLow", true);
-    cfg.deviceName        = prefs.getString("devName", "ESP32-Garden");
-    prefs.end();
+// -------------------- HTTP handlers --------------------
 
-    if (cfg.soilDryRaw < 0)    cfg.soilDryRaw = 0;
-    if (cfg.soilDryRaw > 4095) cfg.soilDryRaw = 4095;
-    if (cfg.soilWetRaw < 0)    cfg.soilWetRaw = 0;
-    if (cfg.soilWetRaw > 4095) cfg.soilWetRaw = 4095;
-    if (cfg.soilDryRaw <= cfg.soilWetRaw){
-        if (cfg.soilDryRaw + 100 <= 4095) {
-            cfg.soilDryRaw = cfg.soilWetRaw + 100;
-        } else {
-            cfg.soilDryRaw = 4095;
-            cfg.soilWetRaw = (4095 - 100 >= 0) ? 3995 : 0;
-        }
-    }
-    if (cfg.tempHighC <= cfg.tempLowC){
-        cfg.tempHighC = cfg.tempLowC + 1.0f;
-        if (cfg.tempHighC > 125.0f){ cfg.tempHighC = 125.0f; cfg.tempLowC = 124.0f; }
-    }
-    if (cfg.humHighPct <= cfg.humLowPct){
-        cfg.humHighPct = cfg.humLowPct + 1.0f;
-        if (cfg.humHighPct > 100.0f){ cfg.humHighPct = 100.0f; cfg.humLowPct = 99.0f; }
-    }
-    if (cfg.soilThresholdPct < 0)   cfg.soilThresholdPct = 0;
-    if (cfg.soilThresholdPct > 100) cfg.soilThresholdPct = 100;
-    if (cfg.relayMode < 0) cfg.relayMode = 0;
-    if (cfg.relayMode > 4) cfg.relayMode = 4;
-    if (cfg.deviceName.length()==0) cfg.deviceName = "ESP32-Garden";
+void handleRoot() {
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  server.sendHeader("Pragma", "no-cache");
+  server.send_P(200, "text/html", INDEX_HTML);
 }
 
-void saveSettings(){
-    prefs.begin("cfg", false);
-    prefs.putString("staSSID", cfg.staSSID);
-    prefs.putString("staPass", cfg.staPass);
-    prefs.putBool("useSTA", cfg.useSTA);
-    prefs.putInt("soilDryRaw", cfg.soilDryRaw);
-    prefs.putInt("soilWetRaw", cfg.soilWetRaw);
-    prefs.putInt("soilThr", cfg.soilThresholdPct);
-    prefs.putFloat("tHigh", cfg.tempHighC);
-    prefs.putFloat("tLow", cfg.tempLowC);
-    prefs.putFloat("hHigh", cfg.humHighPct);
-    prefs.putFloat("hLow", cfg.humLowPct);
-    prefs.putInt("relayMode", cfg.relayMode);
-    prefs.putBool("rActLow", cfg.relayActiveLow);
-    prefs.putString("devName", cfg.deviceName);
-    prefs.end();
+void handleStatus() {
+  bool staConn = (WiFi.status() == WL_CONNECTED);
+  bool soilFresh = soilReadingFresh();
+  bool shtFresh = shtReadingFresh();
+
+  float soilOut = soilFresh ? soilPercent : NAN;
+  float tempOut = shtFresh ? tempC : NAN;
+  float humOut = shtFresh ? humidity : NAN;
+
+  static String j;
+  j.reserve(3400);
+  j = "";
+
+  j += "{";
+  j += "\"ok\":true";
+  j += ",\"version\":\"";
+  j += jsonEscape(APP_VERSION);
+  j += "\"";
+  j += ",\"uptime\":";
+  j += String(millis() / 1000UL);
+  j += ",\"freeHeap\":";
+  j += String(ESP.getFreeHeap());
+
+  j += ",\"control\":{";
+  j += "\"mode\":\"";
+  j += modeName(runtimeMode);
+  j += "\"";
+  j += ",\"relayOn\":";
+  j += boolJson(relayState);
+  j += ",\"reason\":\"";
+  j += jsonEscape(relayReason);
+  j += "\"";
+  j += ",\"ageSec\":";
+  j += String((millis() - lastRelayChangeMs) / 1000UL);
+  j += "}";
+
+  j += ",\"auto\":{";
+  j += "\"target\":";
+  j += boolJson(lastEval.target);
+  j += ",\"fault\":";
+  j += boolJson(lastEval.fault);
+  j += ",\"reason\":\"";
+  j += jsonEscape(lastEval.reason);
+  j += "\"";
+  j += ",\"combine\":\"";
+  j += lastEval.combineAny ? "ANY" : "ALL";
+  j += "\"";
+  j += ",\"enabledCount\":";
+  j += String(lastEval.enabledCount);
+  j += ",\"soilActive\":";
+  j += boolJson(lastEval.soilActive);
+  j += ",\"tempActive\":";
+  j += boolJson(lastEval.tempActive);
+  j += ",\"humActive\":";
+  j += boolJson(lastEval.humActive);
+  j += "}";
+
+  j += ",\"soil\":{";
+  j += "\"enabled\":";
+  j += boolJson(settings.soilEnabled);
+  j += ",\"valid\":";
+  j += boolJson(soilFresh);
+  j += ",\"raw\":";
+  j += jf(soilRawFiltered);
+  j += ",\"percent\":";
+  j += jf(soilOut);
+  j += ",\"threshold\":";
+  j += jf(settings.soilThreshold);
+  j += ",\"hysteresis\":";
+  j += jf(settings.soilHysteresis);
+  j += ",\"active\":";
+  j += boolJson(lastEval.soilActive);
+  j += "}";
+
+  j += ",\"sht31\":{";
+  j += "\"valid\":";
+  j += boolJson(shtFresh);
+  j += ",\"tempC\":";
+  j += jf(tempOut);
+  j += ",\"humidity\":";
+  j += jf(humOut);
+  j += ",\"tempEnabled\":";
+  j += boolJson(settings.tempEnabled);
+  j += ",\"humEnabled\":";
+  j += boolJson(settings.humEnabled);
+  j += "}";
+
+  j += ",\"wifi\":{";
+  j += "\"staEnabled\":";
+  j += boolJson(settings.staEnabled);
+  j += ",\"staConnected\":";
+  j += boolJson(staConn);
+  j += ",\"staStatus\":\"";
+  j += wifiStatusName(WiFi.status());
+  j += "\"";
+  j += ",\"staSsid\":\"";
+  j += jsonEscape(staConn ? WiFi.SSID() : settings.staSsid);
+  j += "\"";
+  j += ",\"localIp\":\"";
+  j += jsonEscape(staConn ? WiFi.localIP().toString() : String(""));
+  j += "\"";
+  j += ",\"rssi\":";
+  j += String(staConn ? WiFi.RSSI() : 0);
+  j += ",\"mac\":\"";
+  j += jsonEscape(WiFi.macAddress());
+  j += "\"";
+  j += ",\"hostname\":\"";
+  j += jsonEscape(settings.hostname);
+  j += "\"";
+  j += ",\"apActive\":";
+  j += boolJson(apActive);
+  j += ",\"apSsid\":\"";
+  j += jsonEscape(settings.apSsid);
+  j += "\"";
+  j += ",\"apIp\":\"";
+  j += jsonEscape(apActive ? WiFi.softAPIP().toString() : String(""));
+  j += "\"";
+  j += ",\"apClients\":";
+  j += String(apActive ? WiFi.softAPgetStationNum() : 0);
+  j += ",\"captivePortal\":";
+  j += boolJson(settings.captivePortal);
+  j += ",\"dnsActive\":";
+  j += boolJson(dnsActive);
+  j += "}";
+
+  j += "}";
+
+  sendJson(200, j);
 }
 
-// ================= RESET =================
-void factoryReset(){
-    driveRelay(false);
-    prefs.begin("cfg", false);
-    prefs.clear();
-    prefs.end();
-    delay(300);
-    ESP.restart();
+void handleGetSettings() {
+  static String j;
+  j.reserve(2600);
+  j = "";
+
+  j += "{";
+  j += "\"ok\":true";
+
+  j += ",\"hostname\":\"";
+  j += jsonEscape(settings.hostname);
+  j += "\"";
+
+  j += ",\"staEnabled\":";
+  j += boolJson(settings.staEnabled);
+  j += ",\"staSsid\":\"";
+  j += jsonEscape(settings.staSsid);
+  j += "\"";
+  j += ",\"staPass\":\"";
+  j += jsonEscape(settings.staPass);
+  j += "\"";
+
+  j += ",\"apEnabled\":";
+  j += boolJson(settings.apEnabled);
+  j += ",\"apFallback\":";
+  j += boolJson(settings.apFallback);
+  j += ",\"captivePortal\":";
+  j += boolJson(settings.captivePortal);
+  j += ",\"apHidden\":";
+  j += boolJson(settings.apHidden);
+  j += ",\"apChannel\":";
+  j += String(settings.apChannel);
+  j += ",\"apSsid\":\"";
+  j += jsonEscape(settings.apSsid);
+  j += "\"";
+  j += ",\"apPass\":\"";
+  j += jsonEscape(settings.apPass);
+  j += "\"";
+  j += ",\"apMaxClients\":";
+  j += String(settings.apMaxClients);
+
+  j += ",\"relayActiveLow\":";
+  j += boolJson(settings.relayActiveLow);
+  j += ",\"failSafeOnSensorFault\":";
+  j += boolJson(settings.failSafeOnSensorFault);
+  j += ",\"relayMinOnMs\":";
+  j += String(settings.relayMinOnMs);
+  j += ",\"relayMinOffMs\":";
+  j += String(settings.relayMinOffMs);
+  j += ",\"sensorInterval\":";
+  j += String(settings.sensorInterval);
+
+  j += ",\"soilEnabled\":";
+  j += boolJson(settings.soilEnabled);
+  j += ",\"soilThreshold\":";
+  j += jf(settings.soilThreshold);
+  j += ",\"soilHysteresis\":";
+  j += jf(settings.soilHysteresis);
+  j += ",\"soilDryRaw\":";
+  j += jf(settings.soilDryRaw);
+  j += ",\"soilWetRaw\":";
+  j += jf(settings.soilWetRaw);
+
+  j += ",\"tempEnabled\":";
+  j += boolJson(settings.tempEnabled);
+  j += ",\"tempThreshold\":";
+  j += jf(settings.tempThreshold);
+  j += ",\"tempHysteresis\":";
+  j += jf(settings.tempHysteresis);
+  j += ",\"tempTriggerAbove\":";
+  j += boolJson(settings.tempTriggerAbove);
+
+  j += ",\"humEnabled\":";
+  j += boolJson(settings.humEnabled);
+  j += ",\"humThreshold\":";
+  j += jf(settings.humThreshold);
+  j += ",\"humHysteresis\":";
+  j += jf(settings.humHysteresis);
+  j += ",\"humTriggerAbove\":";
+  j += boolJson(settings.humTriggerAbove);
+
+  j += ",\"combineAny\":";
+  j += boolJson(settings.combineAny);
+
+  j += "}";
+
+  sendJson(200, j);
 }
 
-// ================= BOOT BUTTON =================
-void handleBootButton(){
-    if (digitalRead(PIN_BOOT_BTN) == LOW){
-        if (!bootBtnPressed){ bootBtnPressed = true; bootBtnPressStart = millis(); }
-        else if (millis() - bootBtnPressStart >= FACTORY_HOLD_MS) factoryReset();
-    } else bootBtnPressed = false;
+void handlePostSettings() {
+  Settings next = settings;
+
+  String err;
+  String tmp;
+  int tmpInt = 0;
+  uint32_t tmpULong = 0;
+
+  if (!getStringArg("hostname", tmp, err)) {
+    sendError(400, err);
+    return;
+  }
+  next.hostname = sanitizeHostname(tmp);
+
+  next.staEnabled = getBoolArg("staEnabled");
+
+  if (!getStringArg("staSsid", next.staSsid, err)) {
+    sendError(400, err);
+    return;
+  }
+
+  if (!getStringArg("staPass", next.staPass, err)) {
+    sendError(400, err);
+    return;
+  }
+
+  next.apEnabled = getBoolArg("apEnabled");
+  next.apFallback = getBoolArg("apFallback");
+  next.captivePortal = getBoolArg("captivePortal");
+  next.apHidden = getBoolArg("apHidden");
+
+  if (!readIntArg("apChannel", tmpInt, 1, 13, err)) {
+    sendError(400, err);
+    return;
+  }
+  next.apChannel = (uint8_t)tmpInt;
+
+  if (!getStringArg("apSsid", next.apSsid, err)) {
+    sendError(400, err);
+    return;
+  }
+
+  if (!getStringArg("apPass", next.apPass, err)) {
+    sendError(400, err);
+    return;
+  }
+
+  if (!readIntArg("apMaxClients", tmpInt, 1, 4, err)) {
+    sendError(400, err);
+    return;
+  }
+  next.apMaxClients = (uint8_t)tmpInt;
+
+  next.relayActiveLow = getBoolArg("relayActiveLow");
+  next.failSafeOnSensorFault = getBoolArg("failSafeOnSensorFault");
+
+  if (!readULongArg("relayMinOnMs", tmpULong, 0, 3600000UL, err)) {
+    sendError(400, err);
+    return;
+  }
+  next.relayMinOnMs = tmpULong;
+
+  if (!readULongArg("relayMinOffMs", tmpULong, 0, 3600000UL, err)) {
+    sendError(400, err);
+    return;
+  }
+  next.relayMinOffMs = tmpULong;
+
+  if (!readIntArg("sensorInterval", tmpInt, 1, 60, err)) {
+    sendError(400, err);
+    return;
+  }
+  next.sensorInterval = (uint16_t)tmpInt;
+
+  next.soilEnabled = getBoolArg("soilEnabled");
+
+  if (!readFloatArg("soilThreshold", next.soilThreshold, 0.0f, 100.0f, err)) {
+    sendError(400, err);
+    return;
+  }
+
+  if (!readFloatArg("soilHysteresis", next.soilHysteresis, 0.0f, 100.0f, err)) {
+    sendError(400, err);
+    return;
+  }
+
+  if (!readFloatArg("soilDryRaw", next.soilDryRaw, 0.0f, 4095.0f, err)) {
+    sendError(400, err);
+    return;
+  }
+
+  if (!readFloatArg("soilWetRaw", next.soilWetRaw, 0.0f, 4095.0f, err)) {
+    sendError(400, err);
+    return;
+  }
+
+  next.tempEnabled = getBoolArg("tempEnabled");
+
+  if (!readFloatArg("tempThreshold", next.tempThreshold, -40.0f, 125.0f, err)) {
+    sendError(400, err);
+    return;
+  }
+
+  if (!readFloatArg("tempHysteresis", next.tempHysteresis, 0.0f, 125.0f, err)) {
+    sendError(400, err);
+    return;
+  }
+
+  if (!getStringArg("tempDirection", tmp, err)) {
+    sendError(400, err);
+    return;
+  }
+
+  tmp.toLowerCase();
+
+  if (tmp == "above") {
+    next.tempTriggerAbove = true;
+  } else if (tmp == "below") {
+    next.tempTriggerAbove = false;
+  } else {
+    sendError(400, "tempDirection must be above or below.");
+    return;
+  }
+
+  next.humEnabled = getBoolArg("humEnabled");
+
+  if (!readFloatArg("humThreshold", next.humThreshold, 0.0f, 100.0f, err)) {
+    sendError(400, err);
+    return;
+  }
+
+  if (!readFloatArg("humHysteresis", next.humHysteresis, 0.0f, 100.0f, err)) {
+    sendError(400, err);
+    return;
+  }
+
+  if (!getStringArg("humDirection", tmp, err)) {
+    sendError(400, err);
+    return;
+  }
+
+  tmp.toLowerCase();
+
+  if (tmp == "above") {
+    next.humTriggerAbove = true;
+  } else if (tmp == "below") {
+    next.humTriggerAbove = false;
+  } else {
+    sendError(400, "humDirection must be above or below.");
+    return;
+  }
+
+  if (!getStringArg("combine", tmp, err)) {
+    sendError(400, err);
+    return;
+  }
+
+  tmp.toLowerCase();
+
+  if (tmp == "any") {
+    next.combineAny = true;
+  } else if (tmp == "all") {
+    next.combineAny = false;
+  } else {
+    sendError(400, "combine must be any or all.");
+    return;
+  }
+
+  if (!validateSettings(next, err)) {
+    sendError(400, err);
+    return;
+  }
+
+  Settings old = settings;
+  settings = next;
+
+  saveSettings();
+  resetConditionHysteresis();
+
+  writeRelayOutput(relayState);
+
+  readSensors(true);
+  serviceRelay();
+
+  bool netChanged = networkSettingsChanged(old, settings);
+
+  if (netChanged) {
+    networkDirty = true;
+    networkApplyAt = millis() + 800UL;
+  }
+
+  String resp = "{\"ok\":true,\"networkReconfig\":";
+  resp += boolJson(netChanged);
+  resp += "}";
+  sendJson(200, resp);
 }
 
-// ================= RELAY =================
-void driveRelay(bool on){
-    relayState = on;
-    int lvl = cfg.relayActiveLow ? (on ? LOW : HIGH) : (on ? HIGH : LOW);
-    digitalWrite(PIN_RELAY, lvl);
+void handleControl() {
+  if (!server.hasArg("mode")) {
+    sendError(400, "Missing mode.");
+    return;
+  }
+
+  String mode = server.arg("mode");
+  mode.toLowerCase();
+
+  if (mode == "auto") {
+    runtimeMode = MODE_AUTO;
+  } else if (mode == "off") {
+    runtimeMode = MODE_OFF;
+  } else if (mode == "on") {
+    runtimeMode = MODE_ON;
+  } else {
+    sendError(400, "mode must be auto, off, or on.");
+    return;
+  }
+
+  serviceRelay();
+
+  String resp = "{\"ok\":true,\"mode\":\"";
+  resp += modeName(runtimeMode);
+  resp += "\",\"relayOn\":";
+  resp += boolJson(relayState);
+  resp += "}";
+
+  sendJson(200, resp);
 }
 
-void updateRelay(){
-    if (manualOverride){
-        if (millis() - manualOverrideStart > MANUAL_OVERRIDE_MS){
-            manualOverride = false;
-        } else {
-            driveRelay(manualRelayWanted);
-            return;
-        }
-    }
+void handleCalibrateSoil() {
+  if (!server.hasArg("type")) {
+    sendError(400, "Missing type.");
+    return;
+  }
 
-    if (soilFault){
-        driveRelay(false);
-        return;
-    }
+  String type = server.arg("type");
+  type.toLowerCase();
 
-    const float SOIL_HYST_PCT = 3.0f;
-    const float T_HYST  = 0.5f;
-    const float H_HYST  = 2.0f;
+  if (type != "dry" && type != "wet") {
+    sendError(400, "type must be dry or wet.");
+    return;
+  }
 
-    bool soilTrig;
-    if (relayState)
-        soilTrig = (soilPct < (float)cfg.soilThresholdPct + SOIL_HYST_PCT);
-    else
-        soilTrig = (soilPct < (float)cfg.soilThresholdPct - SOIL_HYST_PCT);
+  int raw = readSoilRawAverage(24);
 
-    bool tempTrig = false, humTrig = false;
-    bool shtFresh = shtOK && shtLastValidMs != 0 && (millis() - shtLastValidMs < SHT_STALE_MS);
-    if (shtFresh){
-        if (!isnan(temperature)){
-            if (tempTrigLatched)
-                tempTrig = (temperature > cfg.tempHighC - T_HYST) || (temperature < cfg.tempLowC + T_HYST);
-            else
-                tempTrig = (temperature > cfg.tempHighC + T_HYST) || (temperature < cfg.tempLowC - T_HYST);
-            tempTrigLatched = tempTrig;
-        }
-        if (!isnan(humidity)){
-            if (humTrigLatched)
-                humTrig = (humidity > cfg.humHighPct - H_HYST) || (humidity < cfg.humLowPct + H_HYST);
-            else
-                humTrig = (humidity > cfg.humHighPct + H_HYST) || (humidity < cfg.humLowPct - H_HYST);
-            humTrigLatched = humTrig;
-        }
-    }
+  if (raw < 0) {
+    sendError(500, "Could not read soil ADC.");
+    return;
+  }
 
-    bool on = false;
-    switch (cfg.relayMode){
-        case 0: on = soilTrig; break;
-        case 1: on = tempTrig; break;
-        case 2: on = humTrig;  break;
-        case 3: on = soilTrig || tempTrig || humTrig; break;
-        case 4:
-            on = soilTrig
-                 && (shtFresh ? tempTrig : true)
-                 && (shtFresh ? humTrig  : true);
-            break;
-    }
-    driveRelay(on);
+  float newDry = settings.soilDryRaw;
+  float newWet = settings.soilWetRaw;
+
+  if (type == "dry") {
+    newDry = (float)raw;
+  } else {
+    newWet = (float)raw;
+  }
+
+  if (fabs(newDry - newWet) < 25.0f) {
+    sendError(400, "Calibration points are too close. Move the sensor to a different moisture level first.");
+    return;
+  }
+
+  settings.soilDryRaw = newDry;
+  settings.soilWetRaw = newWet;
+
+  saveSettings();
+  resetConditionHysteresis();
+
+  lastSensorReadMs = 0;
+  readSensors(true);
+  serviceRelay();
+
+  String resp = "{\"ok\":true,\"type\":\"";
+  resp += jsonEscape(type);
+  resp += "\",\"raw\":";
+  resp += String(raw);
+  resp += ",\"dryRaw\":";
+  resp += jf(settings.soilDryRaw);
+  resp += ",\"wetRaw\":";
+  resp += jf(settings.soilWetRaw);
+  resp += "}";
+
+  sendJson(200, resp);
 }
 
-// ================= WIFI =================
-void setupWiFi(){
-    WiFi.persistent(false);
-    WiFi.mode(WIFI_AP_STA);
+void handleConnect() {
+  if (!server.hasArg("ssid")) {
+    sendError(400, "Missing ssid.");
+    return;
+  }
 
-    uint8_t mac[6]; WiFi.macAddress(mac);
-    char apName[32];
-    snprintf(apName, sizeof(apName), "%s-%02X%02X%02X",
-             AP_SSID, mac[3], mac[4], mac[5]);
-    WiFi.softAP(apName, AP_PASSWORD);
+  String ssid = server.arg("ssid");
+  String pass = server.hasArg("pass") ? server.arg("pass") : "";
 
-    wifiWantConnect = cfg.useSTA && cfg.staSSID.length() > 0;
-    if (wifiWantConnect){
-        WiFi.begin(cfg.staSSID.c_str(), cfg.staPass.c_str());
-        lastWifiRetry = millis();
-    }
+  Settings next = settings;
+  next.staEnabled = true;
+  next.staSsid = ssid;
+  next.staPass = pass;
+
+  String err;
+  if (!validateSettings(next, err)) {
+    sendError(400, err);
+    return;
+  }
+
+  settings = next;
+  saveSettings();
+
+  networkDirty = true;
+  networkApplyAt = millis() + 600UL;
+
+  sendJson(200, "{\"ok\":true,\"message\":\"STA credentials saved; reconnecting.\"}");
 }
 
-void checkWiFi(){
-    if (!wifiWantConnect) return;
-    if (WiFi.status() != WL_CONNECTED){
-        if (millis() - lastWifiRetry >= WIFI_RETRY_MS){
-            lastWifiRetry = millis();
-            WiFi.disconnect(false, false);
-            delay(50);
-            WiFi.begin(cfg.staSSID.c_str(), cfg.staPass.c_str());
-        }
-        return;
-    }
-    if (millis() - lastWifiHealthCheck >= WIFI_HEALTH_MS){
-        lastWifiHealthCheck = millis();
-        IPAddress gw = WiFi.gatewayIP();
-        if (gw == IPAddress(0,0,0,0)) return;
-        bool alive = false;
-        {
-            WiFiClient probe;
-            probe.setTimeout(3);
-            alive = probe.connect(gw, 80, 3000);
-            probe.stop();
-        }
-        if (!alive){
-            WiFiClient probe2;
-            probe2.setTimeout(3);
-            alive = probe2.connect(gw, 443, 3000);
-            probe2.stop();
-        }
-        if (!alive){
-            WiFi.disconnect(false, false);
-            delay(100);
-            WiFi.begin(cfg.staSSID.c_str(), cfg.staPass.c_str());
-            lastWifiRetry = millis();
-        }
-    }
+void handleForgetSta() {
+  Settings next = settings;
+  next.staEnabled = false;
+  next.staSsid = "";
+  next.staPass = "";
+
+  if (!next.apEnabled) {
+    next.apEnabled = true;
+  }
+
+  String err;
+  if (!validateSettings(next, err)) {
+    sendError(400, err);
+    return;
+  }
+
+  settings = next;
+  saveSettings();
+
+  networkDirty = true;
+  networkApplyAt = millis() + 600UL;
+
+  sendJson(200, "{\"ok\":true,\"message\":\"STA forgotten and AP kept available.\"}");
 }
 
-void restartSTA(){
-    WiFi.disconnect(false, false);
-    delay(100);
-    wifiWantConnect = cfg.useSTA && cfg.staSSID.length() > 0;
-    if (wifiWantConnect){
-        WiFi.begin(cfg.staSSID.c_str(), cfg.staPass.c_str());
-        lastWifiRetry = millis();
+void handleScan() {
+  int n = WiFi.scanNetworks(false, true);
+
+  if (n < 0) {
+    WiFi.scanDelete();
+    sendError(500, "WiFi scan failed.");
+    return;
+  }
+
+  String j = "{\"ok\":true,\"networks\":[";
+  j.reserve(256 + n * 80);
+
+  for (int i = 0; i < n; i++) {
+    if (i > 0) {
+      j += ",";
     }
+
+    j += "{\"ssid\":\"";
+    j += jsonEscape(WiFi.SSID(i));
+    j += "\",\"rssi\":";
+    j += String(WiFi.RSSI(i));
+    j += ",\"encryption\":";
+    j += String((int)WiFi.encryptionType(i));
+    j += "}";
+  }
+
+  j += "]}";
+
+  WiFi.scanDelete();
+  sendJson(200, j);
 }
 
-// ================= SENSORS =================
-void readSensors(){
-    long sum = 0;
-    for (int i=0;i<8;i++){ sum += analogRead(PIN_SOIL); delay(3); }
-    soilRaw = (int)(sum / 8);
+void handleReboot() {
+  sendJson(200, "{\"ok\":true,\"message\":\"rebooting\"}");
+  delay(250);
 
-    const int FAULT_MARGIN = 300;
-    int hiLimit = cfg.soilDryRaw + FAULT_MARGIN;
-    int loLimit = cfg.soilWetRaw - FAULT_MARGIN;
-    if (hiLimit > 4094) hiLimit = 4094;
-    if (loLimit < 1)    loLimit = 1;
-    soilFault = (soilRaw >= hiLimit || soilRaw <= loLimit);
+  setRelay(false, "Reboot");
+  writeRelayOutput(false);
+  delay(80);
 
-    int range = cfg.soilDryRaw - cfg.soilWetRaw;
-    if (range <= 0) range = 1;
-    float pct = 100.0f * (float)(cfg.soilDryRaw - soilRaw) / (float)range;
-    if (pct < 0) pct = 0; if (pct > 100) pct = 100;
-    soilPct = pct;
-
-    bool stale = (shtLastValidMs == 0) || (millis() - shtLastValidMs > SHT_STALE_MS);
-    if ((!shtOK || stale) && (millis() - shtLastRetryMs > SHT_RETRY_MS)){
-        shtLastRetryMs = millis();
-        bool r44 = sht31.begin(0x44);
-        bool r45 = r44 ? false : sht31.begin(0x45);
-        bool ok  = r44 || r45;
-        shtOK = ok;
-    }
-
-    if (shtOK){
-        float t = sht31.readTemperature();
-        float h = sht31.readHumidity();
-        bool valid = !isnan(t) && !isnan(h) &&
-                     t >= -40.0f && t <= 125.0f &&
-                     h >= 0.0f  && h <= 100.1f;
-        if (valid){
-            temperature     = t;
-            humidity        = h;
-            shtLastValidMs  = millis();
-        } else {
-            lastShtErrLog = millis();
-        }
-    }
+  ESP.restart();
 }
 
-// ================= JSON =================
-String getStatusJSON(){
-    StaticJsonDocument<1024> d;
-    d["deviceName"]  = cfg.deviceName;
-    d["soilPct"]     = soilPct;
-    d["soilRaw"]     = soilRaw;
-    d["soilFault"]   = soilFault;
-    bool fresh = shtOK && shtLastValidMs != 0
-                 && (millis() - shtLastValidMs < SHT_STALE_MS);
-    d["shtFresh"]    = fresh;
-    if (fresh && !isnan(temperature)) d["temperature"] = temperature;
-    else                              d["temperature"] = nullptr;
-    if (fresh && !isnan(humidity))    d["humidity"]    = humidity;
-    else                              d["humidity"]    = nullptr;
-    d["relayState"]  = relayState;
-    d["shtOK"]       = shtOK;
-    d["manualOverride"] = manualOverride;
-    unsigned long remain = 0;
-    if (manualOverride){
-        unsigned long elapsed = millis() - manualOverrideStart;
-        remain = (elapsed >= MANUAL_OVERRIDE_MS) ? 0 : (MANUAL_OVERRIDE_MS - elapsed)/1000;
-    }
-    d["manualRemainS"] = remain;
-    d["apIp"]        = WiFi.softAPIP().toString();
-    d["staIp"]       = (WiFi.status()==WL_CONNECTED) ? WiFi.localIP().toString() : "";
-    d["staConnected"]= (WiFi.status()==WL_CONNECTED);
-    d["freeHeap"]    = (uint32_t)ESP.getFreeHeap();
-    unsigned long up = millis()/1000;
-    char buf[32]; snprintf(buf, sizeof(buf), "%luh %lum %lus", up/3600,(up%3600)/60, up%60);
-    d["uptime"] = buf;
-    String out; serializeJson(d, out); return out;
+void handleFactoryReset() {
+  sendJson(200, "{\"ok\":true,\"message\":\"factory reset and reboot\"}");
+  delay(300);
+
+  setRelay(false, "Factory reset");
+  writeRelayOutput(false);
+  delay(80);
+
+  doFactoryReset();
 }
 
-String getSettingsJSON(){
-    StaticJsonDocument<1024> d;
-    d["staSSID"]          = cfg.staSSID;
-    d["staPass"]          = cfg.staPass.length() ? "********" : "";
-    d["useSTA"]           = cfg.useSTA;
-    d["soilDryRaw"]       = cfg.soilDryRaw;
-    d["soilWetRaw"]       = cfg.soilWetRaw;
-    d["soilThresholdPct"] = cfg.soilThresholdPct;
-    d["tempHighC"]        = cfg.tempHighC;
-    d["tempLowC"]         = cfg.tempLowC;
-    d["humHighPct"]       = cfg.humHighPct;
-    d["humLowPct"]        = cfg.humLowPct;
-    d["relayMode"]        = cfg.relayMode;
-    d["relayActiveLow"]   = cfg.relayActiveLow;
-    d["deviceName"]       = cfg.deviceName;
-    String out; serializeJson(d, out); return out;
+void handleNotFound() {
+  String uri = server.uri();
+
+  if (uri.startsWith("/api/") || uri == "/api") {
+    sendError(404, "API endpoint not found.");
+    return;
+  }
+
+  if (uri == "/favicon.ico") {
+    server.send(204, "text/plain", "");
+    return;
+  }
+
+  if (apActive && settings.captivePortal &&
+      server.client().localIP() == WiFi.softAPIP()) {
+    server.sendHeader("Cache-Control", "no-store");
+    server.sendHeader("Location", apRedirectUrl());
+    server.send(302, "text/plain", "");
+    return;
+  }
+
+  server.send(404, "text/plain", "Not found");
 }
 
-void applySettingsFromJSON(JsonDocument &d){
-    bool wifiChanged = false;
+// -------------------- Web server setup --------------------
 
-    if (d.containsKey("staSSID")){
-        String s = d["staSSID"].as<String>();
-        if (s.length() > 32) s = s.substring(0, 32);
-        if (s != cfg.staSSID){ cfg.staSSID = s; wifiChanged = true; }
-    }
-    if (d.containsKey("staPass")){
-        String p = d["staPass"].as<String>();
-        if (p.length() > 63) p = p.substring(0, 63);
-        if (p.length() > 0 && p != "********"){ cfg.staPass = p; wifiChanged = true; }
-    }
-    if (d.containsKey("useSTA")){
-        bool u = d["useSTA"].as<bool>();
-        if (u != cfg.useSTA){ cfg.useSTA = u; wifiChanged = true; }
-    }
-    if (d.containsKey("soilDryRaw")){
-        int v = d["soilDryRaw"].as<int>();
-        if (v>=0 && v<=4095) cfg.soilDryRaw = v;
-    }
-    if (d.containsKey("soilWetRaw")){
-        int v = d["soilWetRaw"].as<int>();
-        if (v>=0 && v<=4095) cfg.soilWetRaw = v;
-    }
-    if (d.containsKey("soilThresholdPct")){
-        int v = d["soilThresholdPct"].as<int>();
-        if (v>=0 && v<=100) cfg.soilThresholdPct = v;
-    }
-    if (d.containsKey("tempHighC"))  { float v = d["tempHighC"].as<float>();  if (!isnan(v) && v > -40.0f && v < 125.0f) cfg.tempHighC  = v; }
-    if (d.containsKey("tempLowC"))   { float v = d["tempLowC"].as<float>();   if (!isnan(v) && v > -40.0f && v < 125.0f) cfg.tempLowC   = v; }
-    if (d.containsKey("humHighPct")) { float v = d["humHighPct"].as<float>(); if (!isnan(v) && v >= 0.0f && v <= 100.0f) cfg.humHighPct = v; }
-    if (d.containsKey("humLowPct"))  { float v = d["humLowPct"].as<float>();  if (!isnan(v) && v >= 0.0f && v <= 100.0f) cfg.humLowPct  = v; }
-    if (d.containsKey("relayMode")){
-        int v = d["relayMode"].as<int>();
-        if (v>=0 && v<=4) cfg.relayMode = v;
-    }
-    if (d.containsKey("relayActiveLow")){
-        bool b = d["relayActiveLow"].as<bool>();
-        if (b != cfg.relayActiveLow){
-            cfg.relayActiveLow = b;
-            driveRelay(relayState);
-        }
-    }
-    if (d.containsKey("deviceName")){
-        String n = d["deviceName"].as<String>();
-        if (n.length()>0 && n.length()<64) cfg.deviceName = n;
-    }
+void setupWebServer() {
+  server.on("/", HTTP_GET, handleRoot);
 
-    if (cfg.soilDryRaw <= cfg.soilWetRaw) cfg.soilDryRaw = cfg.soilWetRaw + 100;
-    if (cfg.tempHighC <= cfg.tempLowC){
-        cfg.tempHighC = cfg.tempLowC + 1.0f;
-        if (cfg.tempHighC > 125.0f){ cfg.tempHighC = 125.0f; cfg.tempLowC = 124.0f; }
-    }
-    if (cfg.humHighPct <= cfg.humLowPct){
-        cfg.humHighPct = cfg.humLowPct + 1.0f;
-        if (cfg.humHighPct > 100.0f){ cfg.humHighPct = 100.0f; cfg.humLowPct = 99.0f; }
-    }
-    saveSettings();
+  server.on("/favicon.ico", HTTP_GET, []() {
+    server.send(204, "text/plain", "");
+  });
 
-    if (wifiChanged){
-        restartSTA();
-    }
+  server.on("/api/status", HTTP_GET, handleStatus);
+  server.on("/api/settings", HTTP_GET, handleGetSettings);
+  server.on("/api/settings", HTTP_POST, handlePostSettings);
+  server.on("/api/control", HTTP_POST, handleControl);
+  server.on("/api/calibrate-soil", HTTP_POST, handleCalibrateSoil);
+  server.on("/api/connect", HTTP_POST, handleConnect);
+  server.on("/api/forget-sta", HTTP_POST, handleForgetSta);
+  server.on("/api/scan", HTTP_GET, handleScan);
+  server.on("/api/reboot", HTTP_POST, handleReboot);
+  server.on("/api/restart", HTTP_POST, handleReboot);
+  server.on("/api/factory-reset", HTTP_POST, handleFactoryReset);
+
+  server.onNotFound(handleNotFound);
+  server.begin();
 }
 
-// ================= HTTP =================
-void handleRoot(){ server.send_P(200, "text/html", DASHBOARD_HTML); }
-void handleStatus(){ server.send(200, "application/json", getStatusJSON()); }
-void handleGetSettings(){ server.send(200, "application/json", getSettingsJSON()); }
+// -------------------- Arduino setup / loop --------------------
 
-void handlePostSettings(){
-    if (!server.hasArg("plain")){
-        server.send(400, "application/json", "{\"error\":\"no body\"}");
-        return;
-    }
-    StaticJsonDocument<1024> d;
-    if (deserializeJson(d, server.arg("plain"))){
-        server.send(400, "application/json", "{\"error\":\"bad json\"}");
-        return;
-    }
-    applySettingsFromJSON(d);
-    server.send(200, "application/json", "{\"ok\":true}");
+void setup() {
+  delay(120);
+
+  pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
+
+  pinMode(RELAY_PIN, INPUT);
+
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+
+  loadSettings();
+
+  digitalWrite(RELAY_PIN, settings.relayActiveLow ? HIGH : LOW);
+  pinMode(RELAY_PIN, OUTPUT);
+
+  relayState = false;
+  writeRelayOutput(false);
+  lastRelayChangeMs = millis();
+  relayReason = "Boot - auto mode";
+  runtimeMode = MODE_AUTO;
+
+  resetConditionHysteresis();
+
+  beginSHT31();
+
+  WiFi.persistent(false);
+  WiFi.setSleep(false);
+
+  reconfigureNetwork();
+  setupWebServer();
+
+  readSensors(true);
+  serviceRelay();
 }
 
-void handleRelayToggle(){
-    manualOverride    = true;
-    manualOverrideStart = millis();
-    manualRelayWanted = !relayState;
-    driveRelay(manualRelayWanted);
-    String out = String("{\"relayState\":") + (relayState?"true":"false") + "}";
-    server.send(200, "application/json", out);
-}
+void loop() {
+  handleBootButton();
 
-void handleRelayClear(){
-    manualOverride = false;
-    updateRelay();
-    server.send(200, "application/json", "{\"ok\":true}");
-}
+  readSensors(false);
+  serviceRelay();
 
-void handleFactoryReset(){
-    server.send(200, "application/json", "{\"ok\":true}");
-    delay(200);
-    factoryReset();
-}
+  if (networkDirty && (int32_t)(millis() - networkApplyAt) >= 0) {
+    reconfigureNetwork();
+  }
 
-void handleNotFound(){
-    if (server.client().localIP() == WiFi.softAPIP()){
-        server.sendHeader("Location", "http://" + WiFi.softAPIP().toString() + "/", true);
-        server.send(302, "text/plain", "");
-        return;
-    }
-    server.send_P(200, "text/html", DASHBOARD_HTML);
-}
+  serviceNetwork();
 
-void setupWebServer(){
-    server.on("/", HTTP_GET, handleRoot);
-    server.on("/api/status", HTTP_GET, handleStatus);
-    server.on("/api/settings", HTTP_GET, handleGetSettings);
-    server.on("/api/settings", HTTP_POST, handlePostSettings);
-    server.on("/api/relay/toggle", HTTP_POST, handleRelayToggle);
-    server.on("/api/relay/clear",  HTTP_POST, handleRelayClear);
-    server.on("/api/factory-reset",HTTP_POST, handleFactoryReset);
-    server.onNotFound(handleNotFound);
-    server.begin();
-}
+  server.handleClient();
 
-void setupCaptivePortal(){
-    dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
-}
-
-// ================= SETUP / LOOP =================
-void setup(){
-    delay(500);
-
-    pinMode(PIN_BOOT_BTN, INPUT_PULLUP);
-
-    Wire.begin(PIN_SDA, PIN_SCL);
-    Wire.setTimeOut(1000);
-    shtOK = sht31.begin(0x44) || sht31.begin(0x45);
-    shtLastRetryMs = millis();
-
-    loadSettings();
-
-    pinMode(PIN_RELAY, OUTPUT);
-    driveRelay(false);
-
-    analogReadResolution(12);
-    analogSetAttenuation(ADC_11db);
-
-    setupWiFi();
-    setupCaptivePortal();
-    setupWebServer();
-
-    readSensors();
-    updateRelay();
-}
-
-void loop(){
-    handleBootButton();
+  if (dnsActive) {
     dnsServer.processNextRequest();
-    server.handleClient();
-    checkWiFi();
+  }
 
-    if (millis() - lastSensorRead >= SENSOR_INTERVAL_MS){
-        lastSensorRead = millis();
-        readSensors();
-        updateRelay();
-    }
+  serviceRelay();
+
+  delay(2);
 }
