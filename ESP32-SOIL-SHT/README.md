@@ -1,3 +1,4 @@
+<img src="https://github.com/xiv3r/esp32-plant-care/blob/main/ESP32-SOIL-SHT/esp32-soil-sht.png">
 
 ## 1. Bill of Materials
 
