@@ -1,24 +1,10 @@
 /*
-  ESP32 Unified Environmental Relay Controller
-
-  Hardware assumptions:
-  - Capacitive soil moisture analog output: GPIO34
-  - SHT31 I2C: SDA GPIO21, SCL GPIO22 (address 0x44 or 0x45)
-  - Relay: GPIO25 (default active LOW)
-  - Boot/factory-reset button: GPIO0 to GND, held LOW 5 seconds
-  - Default AP: ESP32-Env / 12345678
-
-  Required libraries:
-  - ESP32 board package
-  - Adafruit SHT31 Library
-  - Adafruit BusIO
-
-  IMPORTANT:
-  - No firmware can be guaranteed correct in every possible scenario.
-  - The web UI has no authentication. Use only on trusted networks.
-  - Verify all wiring and relay polarity before connecting a load.
-  - GPIO34 is input-only.
-  - Change the default AP password immediately.
+==========================================
+* ESP32 Unified Environmental Relay Controller
+* Author: Raff Alds
+* Github: github.com/xiv3r
+* License: MIT
+==========================================
 */
 
 #include <WiFi.h>
@@ -179,7 +165,7 @@ void doFactoryReset();
 
 String jsonEscape(const String& s) {
   String out;
-  out.reserve(s.length() + 8);
+  out.reserve(s.length() * 2 + 16);
 
   for (size_t i = 0; i < s.length(); i++) {
     char c = s[i];
@@ -432,7 +418,11 @@ bool readULongArg(const char* name, uint32_t& out, uint32_t minValue, uint32_t m
 
 void sendJson(int code, const String& body) {
   server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
-  server.send(code, "application/json", body);
+  if (body.length() == 0) {
+    server.send(code, "application/json", "{\"ok\":false}");
+  } else {
+    server.send(code, "application/json", body);
+  }
 }
 
 void sendError(int code, const String& message) {
@@ -767,6 +757,7 @@ bool networkSettingsChanged(const Settings& a, const Settings& b) {
          a.staPass != b.staPass ||
          a.apEnabled != b.apEnabled ||
          a.apFallback != b.apFallback ||
+         a.captivePortal != b.captivePortal ||
          a.apHidden != b.apHidden ||
          a.apChannel != b.apChannel ||
          a.apSsid != b.apSsid ||
@@ -1473,6 +1464,7 @@ void handleBootButton() {
     }
   } else {
     bootButtonDown = false;
+    bootResetTriggered = false;
   }
 }
 
@@ -1589,6 +1581,7 @@ input,select{
   border-radius:10px;
   padding:9px 10px;
   outline:none;
+  font-size:16px;
 }
 input:focus,select:focus{border-color:var(--blue);box-shadow:0 0 0 2px rgba(59,130,246,.18)}
 label.check input{width:auto}
@@ -1894,6 +1887,7 @@ const numKeys = [
 
 let msgTimer = null;
 let statusBusy = false;
+let scanInFlight = false;
 
 function showMsg(text, type) {
   const el = $('msg');
@@ -1990,6 +1984,9 @@ async function loadSettings(silent) {
     if ($('clearStaPass')) $('clearStaPass').checked = false;
     if ($('clearApPass')) $('clearApPass').checked = false;
 
+    if ($('staPass')) $('staPass').disabled = false;
+    if ($('apPass')) $('apPass').disabled = false;
+
     $('combine').value = d.combineAny ? 'any' : 'all';
     $('tempDirection').value = d.tempTriggerAbove ? 'above' : 'below';
     $('humDirection').value = d.humTriggerAbove ? 'above' : 'below';
@@ -2005,7 +2002,7 @@ async function loadSettings(silent) {
 }
 
 async function pollStatus() {
-  if (statusBusy) return;
+  if (statusBusy || scanInFlight) return;
   statusBusy = true;
 
   try {
@@ -2108,7 +2105,7 @@ async function calibrateSoil(type) {
 }
 
 async function forgetSta() {
-  if (!confirm('Remove the stored station SSID/password and disable STA? AP will be enabled if needed.')) {
+  if (!confirm('Remove the stored station SSID/password and disable STA? AP will be enabled if needed. If you are currently connected via STA, this connection will drop — reconnect to the device AP afterwards.')) {
     return;
   }
 
@@ -2128,6 +2125,7 @@ async function forgetSta() {
 async function scanWifi() {
   const list = $('scanList');
   list.textContent = 'Scanning...';
+  scanInFlight = true;
 
   try {
     const d = await fetchJson('/api/scan', {}, 25000);
@@ -2166,6 +2164,8 @@ async function scanWifi() {
     }
   } catch (e) {
     list.textContent = 'Scan failed: ' + e.message;
+  } finally {
+    scanInFlight = false;
   }
 }
 
@@ -2201,6 +2201,22 @@ async function factoryResetDevice() {
 
   }
   setTimeout(() => setConn(false), 800);
+}
+
+const clearStaEl = $('clearStaPass');
+const clearApEl  = $('clearApPass');
+const staPassEl  = $('staPass');
+const apPassEl   = $('apPass');
+
+if (staPassEl && clearStaEl) {
+  staPassEl.addEventListener('input', () => {
+    if (staPassEl.value.length > 0) clearStaEl.checked = false;
+  });
+}
+if (apPassEl && clearApEl) {
+  apPassEl.addEventListener('input', () => {
+    if (apPassEl.value.length > 0) clearApEl.checked = false;
+  });
 }
 
 $('settingsForm').addEventListener('submit', async (ev) => {
@@ -2496,9 +2512,10 @@ void handlePostSettings() {
     return;
   }
 
-  if (!getStringArg("staPass", next.staPass, err)) {
-    sendError(400, err);
-    return;
+  if (server.hasArg("staPass")) {
+    next.staPass = server.arg("staPass");
+  } else {
+    next.staPass = "";
   }
   if (getBoolArg("clearStaPass")) {
     next.staPass = "";
@@ -2522,9 +2539,10 @@ void handlePostSettings() {
     return;
   }
 
-  if (!getStringArg("apPass", next.apPass, err)) {
-    sendError(400, err);
-    return;
+  if (server.hasArg("apPass")) {
+    next.apPass = server.arg("apPass");
+  } else {
+    next.apPass = "";
   }
   if (getBoolArg("clearApPass")) {
     next.apPass = "";
@@ -2678,8 +2696,25 @@ void handlePostSettings() {
   serviceRelay();
 
   bool netChanged = networkSettingsChanged(old, settings);
+  bool hostnameOnly = netChanged &&
+                      old.hostname != settings.hostname &&
+                      old.staEnabled == settings.staEnabled &&
+                      old.staSsid == settings.staSsid &&
+                      old.staPass == settings.staPass &&
+                      old.apEnabled == settings.apEnabled &&
+                      old.apFallback == settings.apFallback &&
+                      old.captivePortal == settings.captivePortal &&
+                      old.apHidden == settings.apHidden &&
+                      old.apChannel == settings.apChannel &&
+                      old.apSsid == settings.apSsid &&
+                      old.apPass == settings.apPass &&
+                      old.apMaxClients == settings.apMaxClients;
 
-  if (netChanged) {
+  if (hostnameOnly) {
+    stopMDNS();
+    lastMdnsAttempt = 0;
+    startMDNS();
+  } else if (netChanged) {
     networkDirty = true;
     networkApplyAt = millis() + 800UL;
   }
@@ -2790,6 +2825,11 @@ void handleConnect() {
 
   String ssid = server.arg("ssid");
   String pass = server.hasArg("pass") ? server.arg("pass") : "";
+
+  if (ssid.length() > 32) {
+    sendError(400, "SSID must be <=32 characters.");
+    return;
+  }
 
   Settings next = settings;
   next.staEnabled = true;
@@ -2946,7 +2986,7 @@ void setup() {
 
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
 
-  pinMode(RELAY_PIN, INPUT);
+  pinMode(RELAY_PIN, INPUT_PULLDOWN);
 
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
@@ -2959,8 +2999,8 @@ void setup() {
   pinMode(RELAY_PIN, OUTPUT);
 
   relayState = false;
-  writeRelayOutput(false);
   lastRelayChangeMs = millis();
+  writeRelayOutput(false);
   relayReason = "Boot - auto mode";
   runtimeMode = MODE_AUTO;
 
