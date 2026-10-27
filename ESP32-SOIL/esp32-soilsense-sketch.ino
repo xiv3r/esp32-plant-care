@@ -118,6 +118,8 @@ bool          apModeActive   = false;
 // ==================== FORWARD DECLARATIONS ====================
 void loadSettings();
 void saveSettings();
+void requestSaveSettings();
+void flushPendingSettings();
 uint16_t calcCRC(const Settings& s);
 void readSensor();
 int  calculateMoisture(int raw);
