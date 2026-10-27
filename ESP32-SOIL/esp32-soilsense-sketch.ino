@@ -118,8 +118,6 @@ bool          apModeActive   = false;
 // ==================== FORWARD DECLARATIONS ====================
 void loadSettings();
 void saveSettings();
-void requestSaveSettings();
-void flushPendingSettings();
 uint16_t calcCRC(const Settings& s);
 void readSensor();
 int  calculateMoisture(int raw);
@@ -820,15 +818,11 @@ const btnReset   = $('btnReset');
 const btnBack    = $('btnBack');
 const netList    = $('netList');
 
-let userEditingSta   = false;
-let userEditingAp    = false;
-let userEditingApEn  = false;
-let userEditingForce = false;
+let userEditingSta = false;
+let userEditingAp  = false;
 
 inpStaSSID.addEventListener('input', () => { userEditingSta = true; });
 inpApSSID .addEventListener('input', () => { userEditingAp  = true; });
-inpApEnab .addEventListener('change', () => { userEditingApEn  = true; });
-inpForceAP.addEventListener('change', () => { userEditingForce = true; });
 
 let toastTimer = null;
 function showToast(msg, type) {
@@ -892,8 +886,8 @@ function updateStatus(d) {
   if (!userEditingAp && document.activeElement !== inpApSSID) {
     inpApSSID.value = d.apSSID || '';
   }
-  if (!userEditingApEn)  inpApEnab.checked  = d.apEnabled === 1;
-  if (!userEditingForce) inpForceAP.checked = d.forceAP === 1;
+  inpApEnab.checked  = d.apEnabled === 1;
+  inpForceAP.checked = d.forceAP === 1;
 }
 
 async function refreshStatus() {
@@ -932,7 +926,7 @@ async function scanNetworks() {
     while (Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 700));
       const r = await apiFetch('/wifi/scan/results');
-      if (r.state === 'running' || r.state === 'idle') continue;
+      if (r.state === 'running') continue;
       if (r.state === 'failed') throw new Error('Scan failed');
       if (r.state === 'done') { networks = r.networks; break; }
     }
@@ -1015,10 +1009,8 @@ async function saveWifi() {
     inpStaPass.value = '';
     inpApPass.value  = '';
     inpClearSta.checked = false;
-    userEditingSta   = false;
-    userEditingAp    = false;
-    userEditingApEn  = false;
-    userEditingForce = false;
+    userEditingSta = false;
+    userEditingAp  = false;
     setTimeout(() => { if (!document.hidden) refreshStatusQuiet(); }, 3000);
   } catch (err) {
     showToast('Save failed: ' + err.message, 'error');
@@ -1032,10 +1024,6 @@ async function resetWifi() {
   setBusy(btnReset, true);
   try {
     const d = await apiFetch('/wifi/reset');
-    userEditingSta   = false;
-    userEditingAp    = false;
-    userEditingApEn  = false;
-    userEditingForce = false;
     showToast('Reset ✓ Reconnecting…', 'success');
     if (d) updateStatus(d);
     setTimeout(() => { if (!document.hidden) refreshStatusQuiet(); }, 3000);
@@ -1047,10 +1035,8 @@ async function resetWifi() {
 }
 
 btnRefresh.addEventListener('click', () => {
-  userEditingSta   = false;
-  userEditingAp    = false;
-  userEditingApEn  = false;
-  userEditingForce = false;
+  userEditingSta = false;
+  userEditingAp  = false;
   refreshStatus();
 });
 btnScan.addEventListener('click',    scanNetworks);
@@ -1260,14 +1246,7 @@ void setup() {
     }
 
     if (WiFi.status() != WL_CONNECTED &&
-        wifiApplyState == WIFI_IDLE &&
         !wifiCfg.apEnabled && !wifiCfg.forceAP) {
-      wifiCfg.apEnabled = 1;
-      if (strnlen(wifiCfg.apPass, sizeof(wifiCfg.apPass)) < 8) {
-        memset(wifiCfg.apPass, 0, sizeof(wifiCfg.apPass));
-        strncpy(wifiCfg.apPass, AP_PASS, sizeof(wifiCfg.apPass) - 1);
-      }
-      saveWifiConfig();
       WiFi.mode(WIFI_AP_STA);
       WiFi.softAP(wifiCfg.apSSID, wifiCfg.apPass);
       captivePortalStart();
@@ -1307,8 +1286,6 @@ void loop() {
       WiFi.begin(wifiCfg.staSSID, wifiCfg.staPass);
     }
   }
-
-  flushPendingSettings();
 
   delay(5);
   yield();
@@ -1474,34 +1451,6 @@ void saveSettings() {
   if (!EEPROM.commit()) {
     delay(20);
     EEPROM.commit();
-  }
-}
-
-#define SAVE_MIN_INTERVAL_MS 2000UL
-static unsigned long _lastSettingsSave = 0;
-static bool          _settingsDirty    = false;
-static bool          _firstSavePending = true;
-
-void requestSaveSettings() {
-  unsigned long now = millis();
-  if (_firstSavePending ||
-      (now - _lastSettingsSave) >= SAVE_MIN_INTERVAL_MS) {
-    _firstSavePending = false;
-    _lastSettingsSave = now;
-    _settingsDirty    = false;
-    saveSettings();
-  } else {
-    _settingsDirty = true;
-  }
-}
-
-void flushPendingSettings() {
-  if (!_settingsDirty) return;
-  unsigned long now = millis();
-  if ((now - _lastSettingsSave) >= SAVE_MIN_INTERVAL_MS) {
-    _lastSettingsSave = now;
-    _settingsDirty    = false;
-    saveSettings();
   }
 }
 
@@ -2015,7 +1964,7 @@ void handleRelay() {
                    (settings.relayState != newRelay);
     settings.autoMode   = 0;
     settings.relayState = newRelay;
-    if (changed) requestSaveSettings();
+    if (changed) saveSettings();
 
     bool newState = (settings.relayState == 1);
     bool curRelay;
@@ -2053,7 +2002,7 @@ void handleAuto() {
         settings.relayState = newRelay;
       }
     }
-    if (changed) requestSaveSettings();
+    if (changed) saveSettings();
     updateRelay();
   }
   handleStatus();
