@@ -826,6 +826,14 @@ let userEditingAp  = false;
 
 inpStaSSID.addEventListener('input', () => { userEditingSta = true; });
 inpApSSID .addEventListener('input', () => { userEditingAp  = true; });
+inpStaSSID.addEventListener('blur', () => {
+  if (inpStaSSID.value.trim() === (inpStaSSID.dataset.lastServer || ''))
+    userEditingSta = false;
+});
+inpApSSID.addEventListener('blur', () => {
+  if (inpApSSID.value.trim() === (inpApSSID.dataset.lastServer || ''))
+    userEditingAp = false;
+});
 
 let toastTimer = null;
 function showToast(msg, type) {
@@ -889,6 +897,8 @@ function updateStatus(d) {
   if (!userEditingAp && document.activeElement !== inpApSSID) {
     inpApSSID.value = d.apSSID || '';
   }
+  inpStaSSID.dataset.lastServer = d.staSSID || '';
+  inpApSSID.dataset.lastServer  = d.apSSID  || '';
   inpApEnab.checked  = d.apEnabled === 1;
   inpForceAP.checked = d.forceAP === 1;
 }
@@ -1624,6 +1634,7 @@ void serviceWifiApply() {
       return;
 
     case WIFI_APPLY_DONE:
+      wifiRollbackPending = false;
       wifiApplyState = WIFI_IDLE;
       return;
   }
@@ -1859,10 +1870,9 @@ void handleWifiSave() {
     return found ? (neg?-v:v) : def;
   };
 
-  if (wifiApplyState == WIFI_IDLE) {
+  if (!wifiRollbackPending) {
     memcpy(&wifiCfgPrev, &wifiCfg, sizeof(WifiConfig));
   }
-  wifiRollbackPending = false;
 
   String newStaSSID = extractStr("staSSID", wifiCfg.staSSID);
   String newStaPass = extractStr("staPass", "");
@@ -1937,10 +1947,9 @@ void handleWifiSave() {
 }
 
 void handleWifiReset() {
-  if (wifiApplyState == WIFI_IDLE) {
+  if (!wifiRollbackPending) {
     memcpy(&wifiCfgPrev, &wifiCfg, sizeof(WifiConfig));
   }
-  wifiRollbackPending = false;
 
   memset(&wifiCfg, 0, sizeof(wifiCfg));
   wifiCfg.magic = WIFI_CFG_MAGIC;
