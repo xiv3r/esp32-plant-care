@@ -38,7 +38,7 @@ jobs:
         # Compile firmware
         cd ESP32-3SENSE
         mv *.ino ESP32-3SENSE.ino
-        arduino-cli compile --fqbn esp32:esp32:esp32 --output-dir firmware .
+        arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=noota_ffat --output-dir firmware .
         
         # Rename
         rm firmware/*.ino.bin             
