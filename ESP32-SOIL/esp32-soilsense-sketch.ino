@@ -18,6 +18,8 @@
 #include <DNSServer.h>
 #include <string.h>
 #include <ctype.h>
+#include <stdlib.h>
+#include <errno.h>
 
 // ==================== PIN CONFIGURATION ====================
 #define SOIL_MOISTURE_PIN   34
@@ -148,6 +150,7 @@ void captivePortalStart();
 void captivePortalStop();
 bool isApClient();
 void handleCaptiveProbe();
+void normalizeDefaultApPass(char* dst, size_t dstSize);
 
 // ==================== INDEX HTML ====================
 const char INDEX_HTML[] PROGMEM = R"HTMLPAGE(
@@ -762,7 +765,7 @@ h1{text-align:center;margin-bottom:16px;font-size:1.6em}
              autocomplete="off" autocapitalize="off" spellcheck="false">
     </div>
     <div class="form-group">
-      <label for="apPass">AP Password (8-64 chars, blank = keep)</label>
+      <label for="apPass">AP Password (8-63 chars, blank = keep)</label>
       <input type="password" id="apPass" maxlength="64" placeholder="••••••••"
              autocomplete="new-password">
     </div>
@@ -922,7 +925,7 @@ async function scanNetworks() {
     await apiFetch('/wifi/scan');
 
     let networks = null;
-    const deadline = Date.now() + 25000;
+    const deadline = Date.now() + 45000;
     while (Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 700));
       const r = await apiFetch('/wifi/scan/results');
@@ -982,8 +985,8 @@ async function saveWifi() {
   if (apSSID.length < 1 || apSSID.length > 32) {
     showToast('AP SSID must be 1-32 chars', 'error'); inpApSSID.focus(); return;
   }
-  if (apPass.length > 0 && (apPass.length < 8 || apPass.length > 64)) {
-    showToast('AP password must be 8-64 chars', 'error'); inpApPass.focus(); return;
+  if (apPass.length > 0 && (apPass.length < 8 || apPass.length > 63)) {
+    showToast('AP password must be 8-63 chars', 'error'); inpApPass.focus(); return;
   }
   if (!inpForceAP.checked && !inpApEnab.checked && staSSID.length === 0) {
     showToast('Enable AP or enter STA SSID', 'error'); return;
@@ -1149,6 +1152,16 @@ void handleCaptiveProbe() {
   }
 }
 
+void normalizeDefaultApPass(char* dst, size_t dstSize) {
+  size_t n = strnlen(AP_PASS, dstSize - 1);
+  if (n == 0 || (n >= 8 && n <= 63)) {
+    strncpy(dst, AP_PASS, dstSize - 1);
+    dst[dstSize - 1] = 0;
+  } else {
+    dst[0] = 0;
+  }
+}
+
 // ==================== SETUP ====================
 void setup() {
   analogReadResolution(12);
@@ -1185,7 +1198,7 @@ void setup() {
     strncpy(wifiCfg.staSSID, WIFI_SSID, sizeof(wifiCfg.staSSID) - 1);
     strncpy(wifiCfg.staPass, WIFI_PASS, sizeof(wifiCfg.staPass) - 1);
     strncpy(wifiCfg.apSSID,  AP_SSID,   sizeof(wifiCfg.apSSID) - 1);
-    strncpy(wifiCfg.apPass,  AP_PASS,   sizeof(wifiCfg.apPass) - 1);
+    normalizeDefaultApPass(wifiCfg.apPass, sizeof(wifiCfg.apPass));
     wifiCfg.apEnabled = 1;
     wifiCfg.forceAP   = 0;
     wifiCfg.crc       = calcWifiCRC(wifiCfg);
@@ -1276,6 +1289,27 @@ void loop() {
     lastReadTime = now;
     readSensor();
     updateRelay();
+  }
+
+  if (scanState == SCAN_RUNNING &&
+      (now - scanStartMs > 65000UL)) {
+    WiFi.scanDelete();
+    scanState   = SCAN_IDLE;
+    scanStartMs = 0;
+    if (wifiCfg.forceAP) {
+      WiFi.mode(WIFI_AP);
+      WiFi.softAP(wifiCfg.apSSID, wifiCfg.apPass);
+      captivePortalStart();
+      apModeActive = true;
+    }
+  }
+
+  if (wifiCfg.forceAP && wifiApplyState == WIFI_IDLE &&
+      scanState == SCAN_IDLE && WiFi.getMode() != WIFI_AP) {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(wifiCfg.apSSID, wifiCfg.apPass);
+    captivePortalStart();
+    apModeActive = true;
   }
 
   if (!wifiCfg.forceAP && wifiApplyState == WIFI_IDLE &&
@@ -1469,14 +1503,17 @@ uint16_t calcWifiCRC(const WifiConfig& c) {
 void loadWifiConfig() {
   EEPROM.get(WIFI_CFG_ADDR, wifiCfg);
 
+  size_t apPassLen = strnlen(wifiCfg.apPass, sizeof(wifiCfg.apPass));
+  bool   apPassOk  = (apPassLen == 0) ||
+                     (apPassLen >= 8 && apPassLen <= 63);
+
   bool valid = (wifiCfg.magic == WIFI_CFG_MAGIC)
             && (wifiCfg.crc == calcWifiCRC(wifiCfg))
             && (wifiCfg.apEnabled <= 1)
             && (wifiCfg.forceAP <= 1)
             && (strnlen(wifiCfg.apSSID, sizeof(wifiCfg.apSSID)) >= 1)
             && (strnlen(wifiCfg.apSSID, sizeof(wifiCfg.apSSID)) <= 32)
-            && (strnlen(wifiCfg.apPass, sizeof(wifiCfg.apPass)) >= 8)
-            && (strnlen(wifiCfg.apPass, sizeof(wifiCfg.apPass)) <= 64)
+            && apPassOk
             && (strnlen(wifiCfg.staSSID, sizeof(wifiCfg.staSSID)) <= 32)
             && (strnlen(wifiCfg.staPass, sizeof(wifiCfg.staPass)) <= 64)
             && (strnlen(wifiCfg.staSSID, sizeof(wifiCfg.staSSID)) >= 1
@@ -1489,7 +1526,7 @@ void loadWifiConfig() {
     strncpy(wifiCfg.staSSID, WIFI_SSID, sizeof(wifiCfg.staSSID) - 1);
     strncpy(wifiCfg.staPass, WIFI_PASS, sizeof(wifiCfg.staPass) - 1);
     strncpy(wifiCfg.apSSID,  AP_SSID,   sizeof(wifiCfg.apSSID) - 1);
-    strncpy(wifiCfg.apPass,  AP_PASS,   sizeof(wifiCfg.apPass) - 1);
+    normalizeDefaultApPass(wifiCfg.apPass, sizeof(wifiCfg.apPass));
     wifiCfg.apEnabled = 1;
     wifiCfg.forceAP   = 0;
     wifiCfg.crc       = calcWifiCRC(wifiCfg);
@@ -1666,7 +1703,7 @@ void handleWifiStatus() {
 
 void handleWifiScanStart() {
   if (scanState == SCAN_RUNNING) {
-    if (scanStartMs != 0 && (millis() - scanStartMs) < 60000UL) {
+    if ((millis() - scanStartMs) < 60000UL) {
       server.send(200, "application/json", "{\"state\":\"running\"}");
       return;
     }
@@ -1679,6 +1716,7 @@ void handleWifiScanStart() {
 
   wifi_mode_t m = WiFi.getMode();
   if (m == WIFI_AP) {
+    captivePortalStop();
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAP(wifiCfg.apSSID, wifiCfg.apPass);
   }
@@ -1696,7 +1734,6 @@ void handleWifiScanStart() {
 
 void handleWifiScanResults() {
   if (scanState == SCAN_RUNNING &&
-      scanStartMs != 0 &&
       (millis() - scanStartMs > 60000UL)) {
     WiFi.scanDelete();
     scanState   = SCAN_IDLE;
@@ -1707,6 +1744,8 @@ void handleWifiScanResults() {
     if (wifiCfg.forceAP) {
       WiFi.mode(WIFI_AP);
       WiFi.softAP(wifiCfg.apSSID, wifiCfg.apPass);
+      captivePortalStart();
+      delay(200);
     }
     return;
   }
@@ -1727,6 +1766,8 @@ void handleWifiScanResults() {
     if (wifiCfg.forceAP) {
       WiFi.mode(WIFI_AP);
       WiFi.softAP(wifiCfg.apSSID, wifiCfg.apPass);
+      captivePortalStart();
+      delay(200);
     }
     return;
   }
@@ -1739,6 +1780,8 @@ void handleWifiScanResults() {
     if (wifiCfg.forceAP) {
       WiFi.mode(WIFI_AP);
       WiFi.softAP(wifiCfg.apSSID, wifiCfg.apPass);
+      captivePortalStart();
+      delay(200);
     }
     return;
   }
@@ -1757,11 +1800,13 @@ void handleWifiScanResults() {
   scanStartMs = 0;
   server.send(200, "application/json", j);
   server.client().flush();
-  delay(50);
+  delay(120);
 
   if (wifiCfg.forceAP) {
     WiFi.mode(WIFI_AP);
     WiFi.softAP(wifiCfg.apSSID, wifiCfg.apPass);
+    captivePortalStart();
+    delay(200);
   }
 }
 
@@ -1833,9 +1878,9 @@ void handleWifiSave() {
     return;
   }
   if (newApPass.length() > 0 &&
-      (newApPass.length() < 8 || newApPass.length() > 64)) {
+      (newApPass.length() < 8 || newApPass.length() > 63)) {
     server.send(400, "application/json",
-                "{\"error\":\"AP password must be 8-64 chars or empty\"}");
+                "{\"error\":\"AP password must be 8-63 chars or empty\"}");
     return;
   }
   if (newStaSSID.length() > 32) {
@@ -1902,7 +1947,7 @@ void handleWifiReset() {
   strncpy(wifiCfg.staSSID, WIFI_SSID, sizeof(wifiCfg.staSSID) - 1);
   strncpy(wifiCfg.staPass, WIFI_PASS, sizeof(wifiCfg.staPass) - 1);
   strncpy(wifiCfg.apSSID,  AP_SSID,   sizeof(wifiCfg.apSSID) - 1);
-  strncpy(wifiCfg.apPass,  AP_PASS,   sizeof(wifiCfg.apPass) - 1);
+  normalizeDefaultApPass(wifiCfg.apPass, sizeof(wifiCfg.apPass));
   wifiCfg.apEnabled = 1;
   wifiCfg.forceAP   = 0;
   saveWifiConfig();
@@ -2016,25 +2061,44 @@ void handleSettings() {
 
   String body = server.arg("plain");
 
-  auto extract = [&](const char* key, long def)->long {
+  auto extract = [&](const char* key, long def, long &out)->int {
     String k = String("\"") + key + "\":";
     int i = body.indexOf(k);
-    if (i < 0) return def;
+    if (i < 0) { out = def; return 0; }
     i += k.length();
-    while (i < (int)body.length() && (body[i]==' '||body[i]=='\t')) i++;
-    long v = 0; bool neg = false;
-    if (i < (int)body.length() && body[i]=='-'){neg=true;i++;}
-    bool found = false;
-    while (i < (int)body.length() && isdigit((unsigned char)body[i])) {
-      v = v*10 + (body[i]-'0'); i++; found = true;
+    while (i < (int)body.length() &&
+           (body[i]==' '||body[i]=='\t'||body[i]=='\r'||body[i]=='\n')) i++;
+
+    const char* start = body.c_str() + i;
+    char* endp = nullptr;
+    errno = 0;
+    long v = strtol(start, &endp, 10);
+
+    if (endp == start)   return -1;
+    if (errno == ERANGE) return -1;
+
+    char tail = *endp;
+    if (!(tail == ',' || tail == '}' || tail == ' ' ||
+          tail == '\r' || tail == '\n' || tail == '\t' || tail == 0)) {
+      return -1;
     }
-    return found ? (neg?-v:v) : def;
+    out = v;
+    return 1;
   };
 
-  long dv  = extract("dryValue",     settings.dryValue);
-  long wv  = extract("wetValue",     settings.wetValue);
-  long th  = extract("threshold",    settings.threshold);
-  long ri  = extract("readInterval", settings.readInterval);
+  long dv = settings.dryValue;
+  long wv = settings.wetValue;
+  long th = settings.threshold;
+  long ri = settings.readInterval;
+
+  if (extract("dryValue",     settings.dryValue,     dv) < 0 ||
+      extract("wetValue",     settings.wetValue,     wv) < 0 ||
+      extract("threshold",    settings.threshold,    th) < 0 ||
+      extract("readInterval", settings.readInterval, ri) < 0) {
+    server.send(400, "application/json",
+                "{\"error\":\"all fields must be integers\"}");
+    return;
+  }
 
   if (dv < 0 || dv > 4095 || wv < 0 || wv > 4095 || dv <= wv) {
     server.send(400, "application/json",
