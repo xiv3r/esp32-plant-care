@@ -35,7 +35,7 @@ jobs:
         # Compile firmware
         cd ESP32-LIVE 
         mv *.ino ESP32-LIVE.ino
-        arduino-cli compile --fqbn esp32:esp32:esp32 --output-dir firmware .
+        arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=noota_ffat --output-dir firmware .
         
         # Rename
         rm firmware/*.ino.bin             
