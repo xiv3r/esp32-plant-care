@@ -58,23 +58,3 @@ jobs:
         git add -f *.bin
         git commit -m "chore: update firmware binary [skip ci]" || echo "No changes to commit"
         git push origin HEAD:main
-
-    - name: Determine release tag
-      id: get_tag
-      run: |
-        if [ "${{ github.event_name }}" == "release" ]; then
-          TAG_NAME="${{ github.event.release.tag_name }}"
-        else
-          TAG_NAME="v1"
-        fi
-        echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
-
-    - name: Upload files to existing release
-      uses: softprops/action-gh-release@v3
-      with:
-        tag_name: ${{ steps.get_tag.outputs.tag_name }}
-        make_latest: true
-        files: |
-            *.bin
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
