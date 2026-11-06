@@ -34,6 +34,7 @@ jobs:
         arduino-cli core install esp32:esp32
 
         # Install libraries
+        arduino-cli lib install "Adafruit SHT31 Library"
         arduino-cli lib install "BH1750"
         arduino-cli lib install "ArduinoJson"
         arduino-cli lib install "Adafruit BusIO"
