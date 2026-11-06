@@ -34,9 +34,9 @@ jobs:
         arduino-cli core install esp32:esp32
 
         # Install libraries
-        arduino-cli lib install "DHT22"
-        arduino-cli lib install "DHT sensor library"
-        arduino-cli lib install "Adafruit Unified Sensor"
+        arduino-cli lib install "BH1750"
+        arduino-cli lib install "ArduinoJson"
+        arduino-cli lib install "Adafruit BusIO"
         
         # Compile firmware
         cd ESP32-3SENSE
