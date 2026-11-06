@@ -390,7 +390,11 @@ void setup() {
   digitalWrite(RELAY_PIN, RELAY_OFF);
   Serial.begin(115200);
   analogReadResolution(12);
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+  analogSetPinAttenuation(SOIL_PIN, ADC_11db);
+#else
   analogSetPinAttenuation(SOIL_PIN, ADC_ATTEN_DB_11);
+#endif
   dht.begin();
   loadCfg();
   delay(2000);
