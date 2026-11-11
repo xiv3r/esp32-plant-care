@@ -111,7 +111,6 @@ int           staRetries        = 0;
 unsigned long lastApAttemptMs   = 0;
 unsigned long apRetryBackoffMs  = AP_RETRY_INTERVAL_MS;
 unsigned long weatherBackoffMs  = WEATHER_POLL_MS;
-unsigned long weatherFailCount  = 0;
 bool          bootArmed         = false;
 bool          weatherRefreshRequested = false;
 bool          staManualDisable        = false;
@@ -655,7 +654,6 @@ bool fetchWeather() {
 }
 
 void resetWeatherBackoff() {
-  weatherFailCount = 0;
   weatherBackoffMs = WEATHER_POLL_MS;
 }
 
@@ -1070,6 +1068,19 @@ void startAP() {
 // =====================================================================
 //  HTTP HANDLERS
 // =====================================================================
+void sendCaptivePortalRedirect() {
+  if (apMode) {
+    String hostStr = server.client().localIP().toString();
+    if (hostStr == "0.0.0.0" || hostStr.length() == 0) {
+      hostStr = WiFi.softAPIP().toString();
+    }
+    server.sendHeader("Location", "http://" + hostStr + "/", true);
+    server.send(302, "text/plain", "");
+  } else {
+    server.send(404, "text/plain", "Not found");
+  }
+}
+
 void handleRoot()     { statusPageSend(); }
 void handleSettings() { server.send(200, "text/html", settingsPage()); }
 void handleWifi()     { server.send(200, "text/html", wifiPage()); }
@@ -1248,19 +1259,25 @@ void handleLocationsMode() {
 }
 
 void handleRefresh() {
-  lastWeatherPoll        = millis();
+  if (WiFi.status() != WL_CONNECTED) {
+    for (uint8_t i = 0; i < locationCount; i++) wx[i].lastErr = "No WiFi";
+    weatherRefreshRequested = false;
+    evaluateRelay();
+    statusPageSend("⚠️ No STA connection — cannot refresh weather.", true);
+    return;
+  }
+  lastWeatherPoll         = millis();
   weatherRefreshRequested = false;
   bool ok = fetchWeather();
+  evaluateRelay();
   if (ok) {
     resetWeatherBackoff();
   } else {
-    weatherFailCount++;
     unsigned long nb = weatherBackoffMs * 2UL;
     if (nb > WEATHER_FAIL_BACKOFF_MAX_MS || nb < weatherBackoffMs)
       nb = WEATHER_FAIL_BACKOFF_MAX_MS;
     weatherBackoffMs = nb;
   }
-  evaluateRelay();
   statusPageSend(ok ? "🔄 Weather updated." : ("⚠️ Update failed."), !ok);
 }
 
@@ -1315,7 +1332,9 @@ void handleWifiDisconnect() {
   WiFi.setAutoReconnect(false);
   WiFi.disconnect(false, false);
   staConnected = false;
-  server.send(200, "text/html", wifiPage("🔌 Disconnected from STA. Use Reconnect or save new credentials."));
+  server.send(200, "text/html",
+    wifiPage("🔌 Disconnected from STA. This is temporary — the device will auto-reconnect "
+             "after a reboot. Use Reconnect now, or save new credentials to persist changes."));
 }
 
 void handleWifiReconnect() {
@@ -1339,7 +1358,9 @@ void handleWifiApSave() {
   if (!apEn && !staConnected) {
     server.send(400, "text/html",
       wifiPage("Cannot disable AP while STA is disconnected — you would lose access. "
-               "Connect STA first, or keep AP enabled.", true));
+               "Connect STA first, or keep AP enabled. (Note: if STA fails at boot, the "
+               "AP is temporarily re-enabled as a recovery fallback even when disabled.)",
+               true));
     return;
   }
   if (ss.length() > 32) ss = ss.substring(0, 32);
@@ -1366,17 +1387,7 @@ void handleWifiApSave() {
 }
 
 void handleNotFound() {
-  if (apMode) {
-    IPAddress host = server.client().localIP();
-    String hostStr = host.toString();
-    if (hostStr == "0.0.0.0" || hostStr.length() == 0) {
-      hostStr = WiFi.softAPIP().toString();
-    }
-    server.sendHeader("Location", "http://" + hostStr + "/", true);
-    server.send(302, "text/plain", "");
-  } else {
-    server.send(404, "text/plain", "Not found");
-  }
+  sendCaptivePortalRedirect();
 }
 
 void handleApiStatus() {
@@ -1520,24 +1531,12 @@ void setup() {
   server.on("/wifi/disconnect", HTTP_POST, handleWifiDisconnect);
   server.on("/wifi/reconnect",  HTTP_POST, handleWifiReconnect);
   server.on("/api/status",       handleApiStatus);
-  auto redir = []() {
-    if (apMode) {
-      String hostStr = server.client().localIP().toString();
-      if (hostStr == "0.0.0.0" || hostStr.length() == 0) {
-        hostStr = WiFi.softAPIP().toString();
-      }
-      server.sendHeader("Location", "http://" + hostStr + "/", true);
-      server.send(302, "text/plain", "");
-    } else {
-      server.send(404, "text/plain", "Not found");
-    }
-  };
-  server.on("/generate_204",        redir);
-  server.on("/gen_204",             redir);
-  server.on("/hotspot-detect.html", redir);
-  server.on("/connecttest.txt",     redir);
-  server.on("/ncsi.txt",            redir);
-  server.on("/fwlink",              redir);
+  server.on("/generate_204",        sendCaptivePortalRedirect);
+  server.on("/gen_204",             sendCaptivePortalRedirect);
+  server.on("/hotspot-detect.html", sendCaptivePortalRedirect);
+  server.on("/connecttest.txt",     sendCaptivePortalRedirect);
+  server.on("/ncsi.txt",            sendCaptivePortalRedirect);
+  server.on("/fwlink",              sendCaptivePortalRedirect);
   server.onNotFound(handleNotFound);
   server.begin();
 }
@@ -1574,7 +1573,6 @@ void loop() {
       if (ok) {
         resetWeatherBackoff();
       } else {
-        weatherFailCount++;
         unsigned long nb = weatherBackoffMs * 2UL;
         if (nb > WEATHER_FAIL_BACKOFF_MAX_MS || nb < weatherBackoffMs)
           nb = WEATHER_FAIL_BACKOFF_MAX_MS;
@@ -1592,4 +1590,3 @@ void loop() {
     }
   }
 }
-
