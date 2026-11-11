@@ -144,6 +144,8 @@ void setup() {
   loadConfig();
   bootMs = millis();
 
+  ianaToPosix(cfgTz);
+
   WiFi.persistent(false);
   WiFi.mode(WIFI_AP_STA);
   WiFi.setSleep(false);
