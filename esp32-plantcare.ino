@@ -124,7 +124,7 @@ small{color:var(--mut)}
 <div class="grid" style="margin:8px 0 0"><div><small>Free heap</small><div id="heapV">&mdash;</div></div>
 <div><small>Min heap (watermark)</small><div id="heapMinV">&mdash;</div></div>
 <div><small>Largest free block</small><div id="heapMaxV">&mdash;</div></div></div>
-<div class="grid" style="margin-top:8px"><div><small>WiFi RSSI</small><div id="rssiV">&mdash;</div></div>
+<div class="grid" style="margin-top:8px"><div><small>AP clients</small><div id="cliV">&mdash;</div></div>
 <div><small>IP</small><div id="ipV">&mdash;</div></div>
 <div><small>Uptime</small><div id="upV">&mdash;</div></div></div>
 <small>Healthy = values flat over days. Largest free block shrinking while free heap stays high = fragmentation.</small></div>
@@ -148,7 +148,7 @@ function render(j){
  $('bMan').style.display=(j.ovr&&!j.faultSoil)?'block':'none';
  [0,1,2].forEach(m=>$('ov'+m).classList.toggle('on',j.ovr===m));
  $('heapV').textContent=fmtK(j.heap);$('heapMinV').textContent=fmtK(j.heapMin);$('heapMaxV').textContent=fmtK(j.heapMax);
- $('rssiV').textContent=(typeof j.rssi==='number'&&j.rssi!==0)?j.rssi+' dBm':'\u2014';
+ $('cliV').textContent=(typeof j.clients==='number')?j.clients:'\u2014';
  $('ipV').textContent=j.ip;$('upV').textContent=fmtUp(j.up);
  if(!dirty){$('iDry').value=j.soilDry;$('iHyst').value=j.soilHyst;$('iTemp').value=j.tempLimit;$('iInt').value=j.interval;}
 }
@@ -199,7 +199,9 @@ static bool validateConfig(const Config& c, char* err, size_t errlen) {
 // -----------------------------
 void loadCfg() {
   const Config dflt = { 2500, 150, 35.0f, 2500 };
-  prefs.begin("plant", true);
+  if (!prefs.begin("plant", true)) {
+    Serial.println(F("[cfg] NVS open failed - using defaults"));
+  }
   cfg.soilDry        = prefs.getInt("soilDry",  dflt.soilDry);
   cfg.soilHyst       = prefs.getInt("soilHyst", dflt.soilHyst);
   cfg.tempLimit      = prefs.getFloat("tempLim", dflt.tempLimit);
@@ -261,7 +263,10 @@ void sampleSensors() {
 // HTTP handlers
 // -----------------------------
 void handleRoot() {
-  server.sendHeader(F("Captive-Portal"), F("http://192.168.4.1/"));
+  IPAddress a = WiFi.softAPIP();
+  char portalUrl[24];
+  snprintf(portalUrl, sizeof(portalUrl), "http://%u.%u.%u.%u/", a[0], a[1], a[2], a[3]);
+  server.sendHeader(F("Captive-Portal"), portalUrl);
   server.sendHeader(F("Cache-Control"),   F("no-cache"));
   server.send_P(200, PSTR("text/html"), INDEX_HTML);
 }
@@ -278,11 +283,11 @@ void handleStatus() {
     "{\"soil\":%d,\"temp\":%s,\"hum\":%s,\"motor\":%d,\"ovr\":%u,"
     "\"faultSoil\":%d,\"faultDht\":%d,"
     "\"soilDry\":%d,\"soilHyst\":%d,\"tempLimit\":%.1f,\"interval\":%u,"
-    "\"rssi\":%d,\"ip\":\"%s\",\"heap\":%u,\"heapMin\":%u,\"heapMax\":%u,\"up\":%llu}",
+    "\"clients\":%d,\"ip\":\"%s\",\"heap\":%u,\"heapMin\":%u,\"heapMax\":%u,\"up\":%llu}",
     lastSoil, tBuf, hBuf, motorStatus ? 1 : 0, (unsigned)overrideMode,
     faultSoil ? 1 : 0, faultDht ? 1 : 0,
     (int)cfg.soilDry, (int)cfg.soilHyst, (double)cfg.tempLimit, (unsigned)cfg.readIntervalMs,
-    0, ip,
+    (int)WiFi.softAPgetStationNum(), ip,
     (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(),
     (unsigned)ESP.getMaxAllocHeap(),
     (unsigned long long)(uptimeMsAccum / 1000ULL));
