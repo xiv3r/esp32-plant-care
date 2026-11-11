@@ -5,7 +5,7 @@
 *  Github: github.com/xiv3r
 *  Features: WiFi AP+STA | Captive Portal | Settings | Factory Reset
 *  Comprehensive Weather + Air Quality + 7-Day Forecast
-*  WiFi Scan | AP Settings | Uptime Multi-Year
+*  WiFi Scan | AP Settings | Session Uptime
 ===================================================================
 */
 
@@ -35,7 +35,7 @@
 #define WEATHER_REFRESH_MS   600000UL
 #define AIR_REFRESH_MS       900000UL
 #define HTTP_TIMEOUT_MS      10000
-#define MIN_FREE_HEAP        45000
+#define MIN_FREE_HEAP        70000
 #define SCAN_MAX_SHOWN       30
 
 // ---------------- STRUCTS ----------------
@@ -69,13 +69,19 @@ struct WeekWx {
   bool valid = false;
   int   count = 0;
   String date[7];
-  int    code[7];
+  int    code[7]       = {-1,-1,-1,-1,-1,-1,-1};
   String cond[7];
-  float  tMax[7], tMin[7], aMax[7], aMin[7];
-  float  precipSum[7], rainSum[7], snowSum[7];
-  int    precipProb[7];
-  float  windMax[7], gustMax[7];
-  float  uvMax[7];
+  float  tMax[7]       = {NAN,NAN,NAN,NAN,NAN,NAN,NAN};
+  float  tMin[7]       = {NAN,NAN,NAN,NAN,NAN,NAN,NAN};
+  float  aMax[7]       = {NAN,NAN,NAN,NAN,NAN,NAN,NAN};
+  float  aMin[7]       = {NAN,NAN,NAN,NAN,NAN,NAN,NAN};
+  float  precipSum[7]  = {NAN,NAN,NAN,NAN,NAN,NAN,NAN};
+  float  rainSum[7]    = {NAN,NAN,NAN,NAN,NAN,NAN,NAN};
+  float  snowSum[7]    = {NAN,NAN,NAN,NAN,NAN,NAN,NAN};
+  int    precipProb[7] = {-1,-1,-1,-1,-1,-1,-1};
+  float  windMax[7]    = {NAN,NAN,NAN,NAN,NAN,NAN,NAN};
+  float  gustMax[7]    = {NAN,NAN,NAN,NAN,NAN,NAN,NAN};
+  float  uvMax[7]      = {NAN,NAN,NAN,NAN,NAN,NAN,NAN};
   String sunrise[7], sunset[7];
 };
 struct AirWx {
@@ -104,9 +110,10 @@ unsigned long bootEpoch = 0;
 unsigned long btnPressStart = 0;
 bool          btnHeld = false, factoryDone = false;
 String        lastWxError = "", lastAqError = "";
+bool          tzUnmapped = false;
 
 // ---------------- FORWARD DECL ----------------
-void setupWiFi(); void setupWebServer(); void setupDNS(); void handleBootButton();
+void setupWebServer(); void setupDNS(); void handleBootButton();
 void loadConfig(); void saveConfig(); void clearConfig();
 void startAP(); void startSTA(); void applyTimezone();
 String ianaToPosix(const String&);
@@ -136,13 +143,23 @@ void setup() {
   pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
   loadConfig();
   bootMs = millis();
-  setupWiFi();
+
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleep(false);
+  delay(100);
+  startAP();
+
   setupDNS();
   setupWebServer();
   server.begin();
   applyTimezone();
   setenv("TZ", ianaToPosix(cfgTz).c_str(), 1);
   tzset();
+
+  if (cfgSsid.length() > 0) startSTA();
+  else portalMode = true;
+
   if (staConnected) {
     fetchWeather(); fetchAirQuality();
     lastWeatherMs = millis(); lastAirMs = millis();
@@ -161,15 +178,15 @@ void loop() {
     fetchAirQuality(); lastAirMs = millis();
   }
   static unsigned long lastStaCheck = 0;
-  static bool wasStaConnected = true;
+  static bool wasStaConnected = false;
+  bool staNow = (WiFi.status() == WL_CONNECTED);
+  staConnected = staNow;
+  portalMode = !staNow;
   if (millis() - lastStaCheck > 15000) {
     lastStaCheck = millis();
-    if (cfgSsid.length() > 0 && WiFi.status() != WL_CONNECTED) {
-      staConnected = false;
+    if (cfgSsid.length() > 0 && !staNow) {
       WiFi.disconnect(false, false);
       WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
-    } else if (WiFi.status() == WL_CONNECTED) {
-      staConnected = true;
     }
   }
   if (staConnected && !wasStaConnected) {
@@ -195,7 +212,7 @@ void loadConfig() {
   if (cfgLon.length() == 0) cfgLon = String(WEATHER_LON_DEFAULT, 4);
   if (cfgTz.length()  == 0) cfgTz  = WEATHER_TZ_DEFAULT;
   if (cfgApSsid.length() == 0 || cfgApSsid.length() > 32) cfgApSsid = AP_SSID;
-  if (cfgApPass.length() > 63) cfgApPass = AP_PASS;
+  if (cfgApPass.length() != 0 && (cfgApPass.length() < 8 || cfgApPass.length() > 63)) cfgApPass = AP_PASS;
 }
 
 void saveConfig() {
@@ -220,15 +237,6 @@ void clearConfig() {
 }
 
 // ---------------- WIFI ----------------
-void setupWiFi() {
-  WiFi.persistent(false);
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.setSleep(false);
-  delay(100);
-  startAP();
-  if (cfgSsid.length() > 0) startSTA(); else portalMode = true;
-}
-
 void startAP() {
   IPAddress ip(192,168,4,1), gw(192,168,4,1), mk(255,255,255,0);
   WiFi.softAPConfig(ip, gw, mk);
@@ -237,10 +245,6 @@ void startAP() {
 
 void startSTA() {
   WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
-  unsigned long s = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - s < 15000) { delay(200); }
-  if (WiFi.status() == WL_CONNECTED) { staConnected = true; portalMode = false; }
-  else { staConnected = false; portalMode = true; }
 }
 
 // ---------------- DNS ----------------
@@ -582,6 +586,7 @@ bool fetchAirQuality() {
 
 // ---------------- TIME / FORMAT ----------------
 String ianaToPosix(const String& tz) {
+  tzUnmapped = false;
   if (tz.length() == 0) return String("UTC0");
   if (tz.indexOf('/') < 0) return tz;
   if (tz == "Asia/Manila")      return "UTC-8";
@@ -616,7 +621,24 @@ String ianaToPosix(const String& tz) {
   if (tz == "Africa/Lagos")     return "WAT-1";
   if (tz == "UTC")              return "UTC0";
   if (tz == "GMT")              return "GMT0";
-  return tz;
+  if (tz == "Europe/Amsterdam") return "CET-1CEST,M3.5.0,M10.5.0/3";
+  if (tz == "Europe/Brussels")  return "CET-1CEST,M3.5.0,M10.5.0/3";
+  if (tz == "Europe/Vienna")    return "CET-1CEST,M3.5.0,M10.5.0/3";
+  if (tz == "Europe/Stockholm") return "CET-1CEST,M3.5.0,M10.5.0/3";
+  if (tz == "Europe/Warsaw")    return "CET-1CEST,M3.5.0,M10.5.0/3";
+  if (tz == "Europe/Zurich")    return "CET-1CEST,M3.5.0,M10.5.0/3";
+  if (tz == "Europe/Lisbon")    return "WET0WEST,M3.5.0/1,M10.5.0";
+  if (tz == "Europe/Istanbul")  return "UTC-3";
+  if (tz == "Asia/Kuala_Lumpur")return "UTC-8";
+  if (tz == "Asia/Ho_Chi_Minh") return "UTC-7";
+  if (tz == "America/Toronto")  return "EST5EDT,M3.2.0,M11.1.0";
+  if (tz == "America/Vancouver")return "PST8PDT,M3.2.0,M11.1.0";
+  if (tz == "America/Phoenix")  return "MST7";
+  if (tz == "America/Bogota")   return "UTC5";
+  if (tz == "America/Lima")     return "UTC5";
+  if (tz == "America/Argentina/Buenos_Aires") return "UTC3";
+  tzUnmapped = true;
+  return String("UTC0");
 }
 void applyTimezone() {
   String posix = ianaToPosix(cfgTz);
@@ -662,7 +684,11 @@ void setupWebServer() {
     b += "<tr><td>AP IP</td><td>"    + WiFi.softAPIP().toString() + "</td></tr>";
     if (bootEpoch == 0) {
       time_t nowEpoch = time(nullptr);
-      if (nowEpoch > 1600000000) bootEpoch = (unsigned long)nowEpoch;
+      if (nowEpoch > 1600000000) {
+        unsigned long upMs = millis() - bootMs;
+        unsigned long upS  = upMs / 1000UL;
+        bootEpoch = (unsigned long)nowEpoch - upS;
+      }
     }
     String uptimeStr;
     if (bootEpoch > 0) {
@@ -683,7 +709,10 @@ void setupWebServer() {
     time_t now = time(nullptr);
     b += "<tr><td>Time</td><td id='clock'>" + formatLocalTime(now, "%H:%M:%S") + "</td></tr>";
     b += "<tr><td>Date</td><td id='date'>"  + formatLocalTime(now, "%Y-%m-%d") + "</td></tr>";
-    b += "<tr><td>Timezone</td><td>" + htmlEscape(cfgTz) + "</td></tr>";
+    if (tzUnmapped)
+      b += "<tr><td>Timezone</td><td>" + htmlEscape(cfgTz) + " <span style='color:#f59e0b'>(unmapped — clock uses UTC; use a POSIX string like <code>UTC-8</code>)</span></td></tr>";
+    else
+      b += "<tr><td>Timezone</td><td>" + htmlEscape(cfgTz) + "</td></tr>";
     b += "<tr><td>Lat, Lon</td><td>" + htmlEscape(cfgLat) + ", " + htmlEscape(cfgLon) + "</td></tr>";
     if (lastWxError.length()) b += "<tr><td>WX error</td><td>" + htmlEscape(lastWxError) + "</td></tr>";
     if (lastAqError.length()) b += "<tr><td>AQ error</td><td>" + htmlEscape(lastAqError) + "</td></tr>";
@@ -776,8 +805,8 @@ void setupWebServer() {
     }
     if (airWx.valid) {
       b += F("<div class='card'><h2>Air Quality</h2><table>");
-      b += "<tr><td>EU AQI</td><td>" + String(airWx.aqiEu) + " (" + htmlEscape(airWx.aqiEuCat) + ")</td></tr>";
-      b += "<tr><td>US AQI</td><td>" + String(airWx.aqiUs) + " (" + htmlEscape(airWx.aqiUsCat) + ")</td></tr>";
+      b += "<tr><td>EU AQI</td><td>" + (airWx.aqiEu >= 0 ? String(airWx.aqiEu) : String("--")) + " (" + htmlEscape(airWx.aqiEuCat) + ")</td></tr>";
+      b += "<tr><td>US AQI</td><td>" + (airWx.aqiUs >= 0 ? String(airWx.aqiUs) : String("--")) + " (" + htmlEscape(airWx.aqiUsCat) + ")</td></tr>";
       b += "<tr><td>PM1.0</td><td>" + fmtFloat(airWx.pm1,1)  + " &micro;g/m&sup3;</td></tr>";
       b += "<tr><td>PM2.5</td><td>" + fmtFloat(airWx.pm25,1) + " &micro;g/m&sup3;</td></tr>";
       b += "<tr><td>PM10</td><td>"  + fmtFloat(airWx.pm10,1) + " &micro;g/m&sup3;</td></tr>";
@@ -899,21 +928,31 @@ void setupWebServer() {
     if (as == s) {
       server.send(400, "text/html", htmlPage("<p>AP SSID and STA SSID must be different.</p><a href='/settings'>Back</a>", "Error")); return;
     }
-    bool apChanged = (cfgApSsid != as) || (cfgApPass != ap);
-    cfgApSsid = as;
-    cfgApPass = ap;
-    cfgSsid=s; cfgPass=p;
     if (la.length()) {
       char* endp = nullptr;
       double test = strtod(la.c_str(), &endp);
-      if (endp != la.c_str() && *endp == '\0' && test >= -90.0 && test <= 90.0) cfgLat = la;
+      if (!(endp != la.c_str() && *endp == '\0' && test >= -90.0 && test <= 90.0)) {
+        server.send(400, "text/html",
+          htmlPage("<p>Invalid latitude. Must be a number between -90 and 90.</p><a href='/settings'>Back</a>", "Error"));
+        return;
+      }
+      cfgLat = la;
     }
     if (lo.length()) {
       char* endp = nullptr;
       double test = strtod(lo.c_str(), &endp);
-      if (endp != lo.c_str() && *endp == '\0' && test >= -180.0 && test <= 180.0) cfgLon = lo;
+      if (!(endp != lo.c_str() && *endp == '\0' && test >= -180.0 && test <= 180.0)) {
+        server.send(400, "text/html",
+          htmlPage("<p>Invalid longitude. Must be a number between -180 and 180.</p><a href='/settings'>Back</a>", "Error"));
+        return;
+      }
+      cfgLon = lo;
     }
     if (tz.length()) cfgTz=tz;
+    bool apChanged = (cfgApSsid != as) || (cfgApPass != ap);
+    cfgApSsid = as;
+    cfgApPass = ap;
+    cfgSsid=s; cfgPass=p;
     saveConfig(); applyTimezone();
     setenv("TZ", ianaToPosix(cfgTz).c_str(), 1);
     tzset();
@@ -974,6 +1013,7 @@ String makeStatusJson() {
   j += "\"time\":\""   + formatLocalTime(now, "%H:%M:%S") + "\",";
   j += "\"date\":\""   + formatLocalTime(now, "%Y-%m-%d") + "\",";
   j += "\"tzone\":\""  + jsonEscape(cfgTz) + "\",";
+  j += "\"tzone_unmapped\":" + String(tzUnmapped ? "true" : "false") + ",";
   j += "\"wx_valid\":" + String(curWx.valid ? "true" : "false") + ",";
   j += "\"temp\":"     + fmtJsonFloat(curWx.tempC,1) + ",";
   j += "\"humidity\":" + fmtJsonFloat(curWx.humidity,0) + ",";
@@ -981,8 +1021,8 @@ String makeStatusJson() {
   j += "\"pressure\":" + fmtJsonFloat(curWx.pressureMsl,1) + ",";
   j += "\"condition\":\"" + jsonEscape(curWx.condition) + "\",";
   j += "\"aq_valid\":" + String(airWx.valid ? "true" : "false") + ",";
-  j += "\"aqi_eu\":"   + String(airWx.aqiEu) + ",";
-  j += "\"aqi_us\":"   + String(airWx.aqiUs);
+  j += "\"aqi_eu\":"   + (airWx.aqiEu >= 0 ? String(airWx.aqiEu) : String("null")) + ",";
+  j += "\"aqi_us\":"   + (airWx.aqiUs >= 0 ? String(airWx.aqiUs) : String("null"));
   j += "}";
   return j;
 }
@@ -1097,4 +1137,3 @@ void handleBootButton() {
     if (btnHeld) { btnHeld = false; btnPressStart = 0; }
   }
 }
-
