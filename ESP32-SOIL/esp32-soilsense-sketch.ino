@@ -935,7 +935,7 @@ async function scanNetworks() {
     await apiFetch('/wifi/scan');
 
     let networks = null;
-    const deadline = Date.now() + 45000;
+    const deadline = Date.now() + 70000;
     while (Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 700));
       const r = await apiFetch('/wifi/scan/results');
@@ -1726,21 +1726,27 @@ void handleWifiScanStart() {
   WiFi.scanDelete();
 
   wifi_mode_t m = WiFi.getMode();
-  if (m == WIFI_AP) {
-    captivePortalStop();
-    WiFi.mode(WIFI_AP_STA);
-    WiFi.softAP(wifiCfg.apSSID, wifiCfg.apPass);
-  }
-
-  int16_t r = WiFi.scanNetworks(true, false);
-  if (r == WIFI_SCAN_FAILED) {
-    server.send(500, "application/json", "{\"error\":\"scan failed\"}");
-    return;
-  }
+  bool needApRestart = (m == WIFI_AP);
 
   scanState   = SCAN_RUNNING;
   scanStartMs = millis();
   server.send(200, "application/json", "{\"state\":\"running\"}");
+  server.client().flush();
+  delay(50);
+
+  if (needApRestart) {
+    captivePortalStop();
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP(wifiCfg.apSSID, wifiCfg.apPass);
+    captivePortalStart();
+  }
+
+  int16_t r = WiFi.scanNetworks(true, false);
+  if (r == WIFI_SCAN_FAILED) {
+    scanState   = SCAN_IDLE;
+    scanStartMs = 0;
+    return;
+  }
 }
 
 void handleWifiScanResults() {
@@ -1860,7 +1866,12 @@ void handleWifiSave() {
     int i = body.indexOf(k);
     if (i < 0) return def;
     i += k.length();
-    while (i < (int)body.length() && (body[i]==' '||body[i]=='\t')) i++;
+    while (i < (int)body.length() &&
+           (body[i]==' '||body[i]=='\t'||body[i]=='\r'||body[i]=='\n')) i++;
+    if (i < (int)body.length()) {
+      if (body[i]=='t' && body.startsWith("true", i))  return 1;
+      if (body[i]=='f' && body.startsWith("false", i)) return 0;
+    }
     int v = 0; bool neg = false;
     if (i < (int)body.length() && body[i]=='-'){neg=true;i++;}
     bool found = false;
@@ -1881,6 +1892,10 @@ void handleWifiSave() {
   int    apEnabled  = extractInt("apEnabled", wifiCfg.apEnabled);
   int    forceAP    = extractInt("forceAP",   wifiCfg.forceAP);
   String clearStaPw = extractStr("clearStaPass", "0");
+
+  if (newStaSSID.length() == 0) {
+    newStaSSID = String(wifiCfg.staSSID);
+  }
 
   if (newApSSID.length() < 1 || newApSSID.length() > 32) {
     server.send(400, "application/json",
@@ -2020,17 +2035,7 @@ void handleRelay() {
     settings.relayState = newRelay;
     if (changed) saveSettings();
 
-    bool newState = (settings.relayState == 1);
-    bool curRelay;
-    portENTER_CRITICAL(&g_mux);
-    curRelay = g_relayActive;
-    portEXIT_CRITICAL(&g_mux);
-    if (newState != curRelay) {
-      setRelayHardware(newState);
-      portENTER_CRITICAL(&g_mux);
-      g_relayActive = newState;
-      portEXIT_CRITICAL(&g_mux);
-    }
+    updateRelay();
   }
   handleStatus();
 }
@@ -2145,5 +2150,3 @@ void handleNotFound() {
   }
   server.send(404, "text/plain", "404 Not Found");
 }
-
-
