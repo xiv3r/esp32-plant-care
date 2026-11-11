@@ -482,7 +482,7 @@ function snap(name){
     const el=document.querySelector(`[name="${name}"]`);
     if(el && j && j.readings && j.readings.soilMv !== undefined && j.readings.soilMv !== null){
       el.value=j.readings.soilMv;
-      formDirty = true;  
+      formDirty = true;
     }
   }).catch(()=>{});
 }
@@ -494,7 +494,19 @@ formEl.addEventListener("change", ()=>{ formDirty = true; });
 formEl.addEventListener("submit", async e=>{
   e.preventDefault();
   const fd=new FormData(e.target), o={};
-  fd.forEach((v,k)=>o[k]=v);
+  const numFields=new Set(["soilDry","soilWet","moistureLow","moistureHigh",
+    "tempLow","tempHigh","humLow","humHigh","luxLow","luxHigh",
+    "sampleMs","relayMinOnMs","relayMinOffMs","relayMode"]);
+  fd.forEach((v,k)=>{
+    if(k==="sta_ssid"||k==="sta_pass"||k==="ap_ssid"||k==="ap_pass"){ o[k]=String(v); return; }
+    if(numFields.has(k)){
+      if(v===""||v===null||v===undefined){ o[k]=null; return; }
+      const n=Number(v);
+      o[k]=Number.isFinite(n)?n:null;
+      return;
+    }
+    o[k]=v;
+  });
   o.relayInvert  = document.querySelector(`[name="relayInvert"]`).checked  ? "1" : "0";
   o.relayUseSoil = document.querySelector(`[name="relayUseSoil"]`).checked ? "1" : "0";
   o.relayUseTemp = document.querySelector(`[name="relayUseTemp"]`).checked ? "1" : "0";
@@ -643,21 +655,21 @@ void handleSave() {
   setF  ("humHigh",  cfg.humHigh);
   setLux("luxLow",  cfg.luxLow);
   setLux("luxHigh", cfg.luxHigh);
-  if (doc.containsKey("sampleMs")) {
+  if (doc.containsKey("sampleMs") && !doc["sampleMs"].isNull()) {
     long x = doc["sampleMs"].as<long>();
     cfg.sampleMs = (uint16_t)constrain(x, 500, 60000);
   }
-  if (doc.containsKey("relayMinOnMs")) {
+  if (doc.containsKey("relayMinOnMs") && !doc["relayMinOnMs"].isNull()) {
     unsigned long x = doc["relayMinOnMs"].as<unsigned long>();
     if (x > 86400000UL) x = 0;
     cfg.relayMinOnMs = (uint32_t)x;
   }
-  if (doc.containsKey("relayMinOffMs")) {
+  if (doc.containsKey("relayMinOffMs") && !doc["relayMinOffMs"].isNull()) {
     unsigned long x = doc["relayMinOffMs"].as<unsigned long>();
     if (x > 86400000UL) x = 0;
     cfg.relayMinOffMs = (uint32_t)x;
   }
-  if (doc.containsKey("relayMode")) {
+  if (doc.containsKey("relayMode") && !doc["relayMode"].isNull()) {
     long x = doc["relayMode"].as<long>();
     cfg.relayMode = (uint8_t)constrain(x, 0, 3);
   }
@@ -682,7 +694,7 @@ void handleSave() {
     cfg.relayUseLux = (s == "1" || s == "true" || s == "on");
   }
   setS("sta_ssid", cfg.sta_ssid, sizeof(cfg.sta_ssid), false);
-  setS("sta_pass", cfg.sta_pass, sizeof(cfg.sta_pass), true);
+  setS("sta_pass", cfg.sta_pass, sizeof(cfg.sta_pass), false);
   setS("ap_ssid",  cfg.ap_ssid,  sizeof(cfg.ap_ssid),  false);
   setS("ap_pass",  cfg.ap_pass,  sizeof(cfg.ap_pass),  true);
   if (cfg.soilDryMv <= cfg.soilWetMv + 50) {
@@ -777,14 +789,20 @@ void startNetwork() {
     cfg.ap_ssid[sizeof(cfg.ap_ssid) - 1] = '\0';
   }
   bool apStarted = false;
-  if (strlen(cfg.ap_pass) >= 8)
-    apStarted = WiFi.softAP(cfg.ap_ssid, cfg.ap_pass);
-  else
-    apStarted = WiFi.softAP(cfg.ap_ssid);
+  for (uint8_t attempt = 0; attempt < 3 && !apStarted; attempt++) {
+    if (strlen(cfg.ap_pass) >= 8)
+      apStarted = WiFi.softAP(cfg.ap_ssid, cfg.ap_pass);
+    else
+      apStarted = WiFi.softAP(cfg.ap_ssid);
+    if (!apStarted) delay(200);
+  }
 
   apModeActive = apStarted;
   if (apModeActive) {
     dnsServer.start(53, "*", WiFi.softAPIP());
+  } else {
+    delay(1000);
+    ESP.restart();
   }
 }
 void setup() {
@@ -847,11 +865,19 @@ void loop() {
   if (apModeActive) dnsServer.processNextRequest();
   checkBootButton();
 
-  if (!apModeActive && strlen(cfg.sta_ssid) > 0 && WiFi.status() != WL_CONNECTED) {
+  if (!apModeActive && strlen(cfg.sta_ssid) > 0) {
     static unsigned long lastReconnectTry = 0;
+    static uint8_t rcFailCount = 0;
     unsigned long nowRc = millis();
-    if (nowRc - lastReconnectTry >= 30000UL) {
+    if (WiFi.status() == WL_CONNECTED) {
+      rcFailCount = 0;
+    } else if (nowRc - lastReconnectTry >= 30000UL) {
       lastReconnectTry = nowRc;
+      if (rcFailCount >= 3) {
+        delay(100);
+        ESP.restart();
+      }
+      rcFailCount++;
       WiFi.disconnect(true, false);
       delay(100);
       WiFi.mode(WIFI_STA);
