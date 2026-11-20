@@ -6,10 +6,7 @@
 // One unified sketch: sensors, web UI, captive portal, NVS
 // ======================================================
 
-// ======================================================
-//
-// INCLUDES
-// ======================================================
+
 #include <WiFi.h>
 #include <DNSServer.h>
 #include <ESPAsyncWebServer.h>
