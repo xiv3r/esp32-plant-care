@@ -1,6 +1,5 @@
-
 // ======================================================
-// ESP32 Multi Smart Garden 
+// ESP32 Multi Smart Garden - Unified Production Firmware
 // ======================================================
 
 #include <WiFi.h>
@@ -25,6 +24,7 @@
 #include <stdio.h>
 
 // ======================================================
+//
 // FIRMWARE METADATA
 // ======================================================
 #define FW_VERSION "2.4.1"
@@ -38,6 +38,7 @@
 #define NVS_KEY_BOOTS "boots"
 
 // ======================================================
+//
 // PIN MAP (GPIO assignments - fixed hardware contract)
 // ======================================================
 static const uint8_t PIN_I2C_SDA = 21;
@@ -64,6 +65,7 @@ static const uint8_t SRC_BIT_SOIL = 3;
 static const uint8_t SRC_BIT_RAIN = 4;
 
 // ======================================================
+//
 // TUNING TABLES
 // ======================================================
 static const uint16_t INTERVAL_S[6] = {1, 2, 5, 10, 30, 60};
@@ -74,6 +76,7 @@ static const uint8_t MQ_SAMPLE_COUNT[4] = {4, 8, 16, 32};
 static const uint32_t AP_IP_OCTETS[4] = {192, 168, 4, 1};
 
 // ======================================================
+//
 // PERSISTENT CONFIGURATION (packed, CRC-32 guarded, A/B)
 // ======================================================
 typedef struct __attribute__((packed)) {
@@ -179,6 +182,7 @@ typedef struct __attribute__((packed)) {
 } Config;
 
 // ======================================================
+//
 // CRC-32 (IEEE 802.3, bitwise, table-free)
 // ======================================================
 static uint32_t crc32Ieee(const uint8_t* data, size_t len) {
@@ -193,6 +197,7 @@ static uint32_t crc32Ieee(const uint8_t* data, size_t len) {
 }
 
 // ======================================================
+//
 // CONFIG DEFAULTS
 // ======================================================
 static void configDefaults(Config& c) {
@@ -330,6 +335,7 @@ static bool configContentEqual(const Config& a, const Config& b) {
 }
 
 // ======================================================
+//
 // RUNTIME STATE (64-bit counters where it matters)
 // ======================================================
 static Config g_cfg;
@@ -422,6 +428,7 @@ static Adafruit_BME280 g_bme;
 static BH1750 g_bh;
 
 // ======================================================
+//
 // NVS ACCESS - A/B SLOT STRATEGY
 // ======================================================
 static bool nvsReadSlot(const char* key, Config* out) {
@@ -515,6 +522,7 @@ static void bootCountIncrement() {
   g_nvsWrites++;
 }
 // ======================================================
+//
 // HELPERS - clamp, schmitt trigger, EMA, rollover-safe checks
 // ======================================================
 static float clampf(float v, float lo, float hi) {
@@ -555,6 +563,7 @@ static uint64_t uptimeSeconds() {
 }
 
 // ======================================================
+//
 // OUTPUT DRIVERS - LEDC PWM (ABSTRACTED FOR CORE 2.x / 3.x)
 // ======================================================
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
@@ -592,6 +601,7 @@ static void relayApplyLevel(uint8_t index, bool energized) {
 }
 
 // ======================================================
+//
 // SENSOR SAMPLING - NON-BLOCKING STATE MACHINES
 // ======================================================
 static void bmeTick(uint32_t now) {
@@ -711,6 +721,7 @@ static void rainTick(uint32_t now) {
 }
 
 // ======================================================
+//
 // ALERT AGGREGATION
 // ======================================================
 static bool alertBitActive(const Config& c, uint8_t bit) {
@@ -807,6 +818,7 @@ static uint8_t relayAutoBits(const Config& c, uint8_t relayIndex) {
 }
 
 // ======================================================
+//
 // RELAY MATRIX ENGINE (dedicated + unified GPIO25)
 // ======================================================
 static bool relayChannelEnergized(uint8_t relayEnabled, uint8_t mode, uint8_t autoBits) {
@@ -828,6 +840,7 @@ static void relayTick(uint32_t now) {
 }
 
 // ======================================================
+//
 // BUZZER ENGINE - PATTERN PLAYER, AUTO-MUTE
 // ======================================================
 static const uint8_t BUZZ_PULSE_COUNT[5] = {1, 2, 3, 1, 5};
@@ -958,6 +971,7 @@ static void buzzerTick(uint32_t now) {
 }
 
 // ======================================================
+//
 // LED ENGINE - AUTO / ALWAYS / OFF WITH 2 HZ ALERT BLINK
 // ======================================================
 static void ledTick(uint32_t now) {
@@ -982,6 +996,7 @@ static void ledTick(uint32_t now) {
 }
 
 // ======================================================
+//
 // OLED ENGINE - PAGES, IDLE SLEEP, NON-BLOCKING REDRAW
 // ======================================================
 static void oledWriteContrast() {
@@ -1190,6 +1205,7 @@ static void oledTick(uint32_t now) {
 }
 
 // ======================================================
+//
 // GPIO0 BOOT BUTTON - 5 SECOND FACTORY RESET HOLD
 // ======================================================
 static void factoryWipeAndRestart() {
@@ -1249,6 +1265,7 @@ static void buttonTick(uint32_t now) {
 }
 
 // ======================================================
+//
 // EMBEDDED WEB APPLICATION (PROGMEM, SINGLE PAGE APP)
 // ======================================================
 static const char INDEX_HTML[] PROGMEM = R"rawliteral(
@@ -3109,6 +3126,7 @@ setInterval(() => { fetchState(); }, 2000);
 )rawliteral";
 
 // ======================================================
+//
 // JSON WRITER - FIXED BUFFER, ZERO HEAP CHURN PER REQUEST
 // ======================================================
 struct JsonBuf {
@@ -3189,6 +3207,7 @@ static const char* resetReasonString() {
 }
 
 // ======================================================
+//
 // STATE SNAPSHOT - MANUAL JSON INTO STATIC BUFFER
 // ======================================================
 static char g_stateBuf[2600];
@@ -3267,6 +3286,7 @@ static void buildStateJson() {
 }
 
 // ======================================================
+//
 // CONFIG SNAPSHOT - FULL ECHO FOR THE SETTINGS UI
 // ======================================================
 static char g_configBuf[2600];
@@ -3318,11 +3338,13 @@ static void buildConfigJson() {
               cfgSnap.apChannel, cfgSnap.apHidden, cfgSnap.apMaxConn);
 }
 // ======================================================
+//
 // FORWARD DECLARATIONS
 // ======================================================
 static void applyApConfig();
 
 // ======================================================
+//
 // TYPED JSON FIELD EXTRACTION (partial saves are legal)
 // ======================================================
 static void jBool(const JsonDocument& doc, const char* key, uint8_t* dst) {
@@ -3374,6 +3396,7 @@ static void jString(const JsonDocument& doc, const char* key, char* dst, size_t 
 }
 
 // ======================================================
+//
 // SECTION APPLY - STAGED WRITE, VALIDATE, THEN COMMIT
 // ======================================================
 static bool applySection(const char* section, const JsonDocument& doc) {
@@ -3516,6 +3539,7 @@ static bool sectionChangedAndSaved(Config& before) {
 }
 
 // ======================================================
+//
 // HANDLERS - STATE & CONFIG
 // ======================================================
 static void handleState(AsyncWebServerRequest* request) {
@@ -3565,6 +3589,7 @@ static void handleConfigPost(AsyncWebServerRequest* request) {
 }
 
 // ======================================================
+//
 // HANDLERS - SENSOR & ACTUATOR PROBES
 // ======================================================
 static void handleTestBme(AsyncWebServerRequest* request) {
@@ -3710,8 +3735,8 @@ static void handleFactoryReset(AsyncWebServerRequest* request) {
   g_pendingRestartMs = millis() + 1200UL;
   sendJson(request, 200, "{\"ok\":true}");
 }
-
 // ======================================================
+//
 // WEB SERVER + CAPTIVE PORTAL
 // ======================================================
 static DNSServer dnsServer;
@@ -3793,6 +3818,7 @@ static void registerRoutes() {
 }
 
 // ======================================================
+//
 // HARDWARE INITIALIZATION
 // ======================================================
 static void initI2cDevices() {
@@ -3870,6 +3896,7 @@ static void initWifiAndPortal() {
 }
 
 // ======================================================
+//
 // SETUP
 // ======================================================
 void setup() {
@@ -3887,6 +3914,7 @@ void setup() {
 }
 
 // ======================================================
+//
 // RESTART WATCHDOG (reboot / factory reset scheduling)
 // ======================================================
 static void restartTick(uint32_t now) {
@@ -3903,6 +3931,7 @@ static void restartTick(uint32_t now) {
 }
 
 // ======================================================
+//
 // MAIN LOOP - FULLY NON-BLOCKING
 // ======================================================
 void loop() {
