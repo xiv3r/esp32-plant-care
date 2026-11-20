@@ -50,8 +50,7 @@ jobs:
         arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=noota_ffat --output-dir firmware .
 
         # Rename
-        mv firmware/*.ino.merged.bin      firmware/esp32-multi-0x0.bin
-        mv firmware/esp32-multi-0x0.bin .
+        mv firmware/*.bin .
 
     - name: Commit firmware binary
       run: |
