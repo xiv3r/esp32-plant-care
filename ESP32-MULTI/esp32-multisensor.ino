@@ -1,7 +1,15 @@
 // ======================================================
+//
 // ESP32 Multi Smart Garden - Unified Production Firmware
+// Board: ESP32 Dev Module (WROOM-32) - Arduino IDE 2.x
+// Core: Arduino-ESP32 2.x or 3.x, ArduinoJson 7.x
+// One unified sketch: sensors, web UI, captive portal, NVS
 // ======================================================
 
+// ======================================================
+//
+// INCLUDES
+// ======================================================
 #include <WiFi.h>
 #include <DNSServer.h>
 #include <ESPAsyncWebServer.h>
@@ -50,11 +58,11 @@ static const uint8_t PIN_BUZZER = 26;
 static const uint8_t PIN_LED_ANODE = 33;
 static const uint8_t PIN_BUTTON_GPIO0 = 0;
 static const uint8_t PIN_RELAY_UNIFIED = 25;
-static const uint8_t PIN_RELAY_BME = 15;
-static const uint8_t PIN_RELAY_BH = 2;
-static const uint8_t PIN_RELAY_MQ = 4;
-static const uint8_t PIN_RELAY_SOIL = 5;
-static const uint8_t PIN_RELAY_RAIN = 18;
+static const uint8_t PIN_RELAY_BME = 23;
+static const uint8_t PIN_RELAY_BH = 19;
+static const uint8_t PIN_RELAY_MQ = 18;
+static const uint8_t PIN_RELAY_SOIL = 17;
+static const uint8_t PIN_RELAY_RAIN = 16;
 static const uint8_t RELAY_PIN[6] = {PIN_RELAY_UNIFIED, PIN_RELAY_BME, PIN_RELAY_BH, PIN_RELAY_MQ, PIN_RELAY_SOIL, PIN_RELAY_RAIN};
 static const uint8_t RELAY_COUNT = 6;
 
