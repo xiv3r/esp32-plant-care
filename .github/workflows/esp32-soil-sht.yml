@@ -34,11 +34,8 @@ jobs:
         arduino-cli core install esp32:esp32
 
         # Install libraries
-        arduino-cli lib install "Adafruit SHT31 Library"
-        arduino-cli lib install "Adafruit BusIO"
-        arduino-cli lib install "Adafruit Unified Sensor"
-        arduino-cli lib install "ArduinoJson"
-        
+        arduino-cli lib install "Adafruit GFX Library" "Adafruit SSD1306" "Adafruit SHT31 Library" "Adafruit BusIO"
+
         # Compile firmware
         cd ESP32-SOIL-SHT
         mv *.ino ESP32-SOIL-SHT.ino
