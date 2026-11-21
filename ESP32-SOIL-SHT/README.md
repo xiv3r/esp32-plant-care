@@ -1,105 +1,82 @@
 <img src="https://github.com/xiv3r/esp32-plant-care/blob/main/ESP32-SOIL-SHT/esp32-soil-sht.png">
 
-## 1. Bill of Materials
+## 1. Hardware Wiring
 
-| Component | Spec / Notes |
+| Component | ESP32 Pin | Notes |
+|---|---|---|
+| SHT31 SDA | GPIO 21 | I²C, 400 kHz |
+| SHT31 SCL | GPIO 22 | I²C, 400 kHz |
+| OLED SSD1306 SDA/SCL | GPIO 21 / 22 | Same I²C bus, addr 0x3C |
+| Soil sensor (analog out) | GPIO 34 | 12-bit ADC, 11 dB attenuation |
+| Relay 1 (SHT) | GPIO 25 | Active-high/low configurable |
+| Relay 2 (Soil) | GPIO 26 | Active-high/low configurable |
+| Buzzer | GPIO 27 | Active-high/low configurable |
+| LED (anode) | GPIO 33 | PWM-capable (LEDC) |
+| BOOT button | GPIO 0 | Hold 5 s = factory reset |
+
+> Power the SHT31 and OLED from 3.3 V. Soil sensor VCC per its datasheet (usually 3.3–5 V); its analog output must not exceed 3.3 V.
+
+## 2. Flash & First Boot
+
+1. Open the `.ino` in Arduino IDE (or PlatformIO). Install libraries:
+   - `Adafruit SSD1306`
+   - `Adafruit GFX`
+   - `Adafruit SHT31`
+2. Select board **ESP32 Dev Module**, correct COM port, upload.
+3. On first boot the device creates a Wi-Fi AP:
+   - **SSID:** `ESP32_SOIL_SHT`
+   - **Password:** `12345678`
+4. Connect to it and open **http://192.168.4.1** (captive portal should pop up automatically).
+
+## 3. First-Time Configuration (do these in order)
+
+### a) Wi-Fi AP page
+- Set your own SSID and a password ≥ 8 characters.
+- Click **Apply & restart AP** — you must reconnect with the new credentials.
+
+### b) Soil page — calibrate
+1. Put probe in **air**, note the *Raw* value shown in the readout.
+2. Put probe in **water**, note the *Raw* value.
+3. Enter both into **Calibration raw DRY** / **Calibration raw WET**, then **Save**.
+   - DRY should be the higher number (default 3200), WET the lower (default 1400).
+4. Set **ON when moisture ≤** (e.g. 30 %) and **OFF when moisture ≥** (e.g. 60 %).
+
+### c) SHT page
+- Set temperature/humidity ON and OFF thresholds. OFF must be lower than ON (hysteresis).
+- Defaults: ON at 30 °C / 80 %RH, OFF at 26 °C / 60 %RH.
+
+### d) Other pages (Buzzer, LED, OLED)
+- Enable/disable, set modes and intervals. OLED pages rotate automatically between sensor and status views.
+
+## 4. Daily Use
+
+- **Dashboard** shows live values, 120-sample history charts, and quick relay buttons (ON / Auto / OFF).
+- All settings are saved to NVS with a debounce (~1.5 s) and wear-leveled across two slots; a power cut mid-write cannot corrupt the previous config.
+- The status LED on the OLED page and the web top-bar dot show live connection state.
+
+## 5. Maintenance
+
+| Action | How |
 |---|---|
-| ESP32 Dev Module | 30-pin or 38-pin, 3.3V logic, ADC1 on GPIO32–39 |
-| Capacitive soil moisture sensor | v1.2 or v2.0, 3.3V-tolerant (most are 3.3–5.5V) |
-| SHT31 breakout | Adafruit #2857 or generic GY-SHT31, I2C, 3.3V |
-| Relay module | 1-channel, **opto-isolated preferred**, 5V coil, active-LOW typical |
-| Boot button | Onboard `BOOT` (GPIO0) — no external button needed |
-| Power supply | 5V ≥ 1A (relay coil + ESP32), or USB 5V |
-| Optional | 2× 4.7kΩ pull-ups for I2C (often onboard SHT31 breakout) |
+| Reboot | System page → **Reboot**, or power cycle |
+| Factory reset | System page → **Factory reset**, or hold **BOOT (GPIO 0) for 5 s** |
+| Force sensor read | SHT page → **Read now** |
+| Test buzzer | Buzzer page → **Test 0.6 s** |
+| Advance OLED page | OLED page → **Next page now** |
 
----
+## 6. Troubleshooting
 
-## 2. Pin Assignment
+| Symptom | Check |
+|---|---|
+| `SHT31 ERR` on OLED | I²C wiring, 3.3 V power, address 0x44 (some modules are 0x45 — not supported here) |
+| Soil % stuck at 0 or 100 | Re-calibrate; ensure DRY > WET raw values |
+| Relay never clicks | Verify **Active HIGH** setting matches your relay module |
+| Web page won't load | Reconnect to AP; try `http://192.168.4.1` directly (not HTTPS) |
+| Can't reconnect after changing AP | Wait ~10 s for AP restart, then join the new SSID |
+| Heap errors / JSON overflow | Reduce `HISTORY_MAX` or `oledIntervalMs`; check `minHeap` on System page |
 
-| Signal | GPIO | Direction | Notes |
-|---|---|---|---|
-| Soil analog | **GPIO34** | Input only | ADC1_CH6 — WiFi-safe |
-| Relay control | **GPIO25** | Output | Drives relay IN |
-| Boot button | **GPIO0** | Input (pullup) | Onboard BOOT button |
-| I2C SDA | **GPIO21** | Bidir | Default ESP32 SDA |
-| I2C SCL | **GPIO22** | Bidir | Default ESP32 SCL |
-| 3V3 | 3V3 pin | Power | Sensors |
-| GND | GND pins | Ground | Common ground |
-| 5V (VIN) | 5V pin | Power | Relay module VCC |
+## 7. Safety Notes
 
----
-
-## 3. Connection Tables
-
-### 3.1 Capacitive Soil Moisture Sensor
-
-| Sensor pin | Connect to | Notes |
-|---|---|---|
-| VCC | ESP32 **3V3** | Do **not** use 5V — ESP32 ADC max is 3.3V |
-| GND | ESP32 **GND** | Common ground |
-| AOUT (signal) | ESP32 **GPIO34** | Input-only pin, ADC1 — no pull-up needed |
-
-**Notes:**
-- GPIO34 is **input-only** (no internal pull-up, no output) — correct for analog input.
-- **Never** power the soil sensor from 5V while its signal feeds a 3.3V ADC pin. The AOUT would swing to ~5V, damaging GPIO34.
-- Some v1.2 modules are 3.3–5.5V tolerant; v2.0 is 3.3V-only. When in doubt, use 3V3.
-- Long cable runs (>2m) pick up noise — twist signal + GND, or add a 100nF cap from AOUT to GND near the ESP32.
-
-### 3.2 SHT31 (I2C Temperature/Humidity)
-
-| SHT31 pin | Connect to | Notes |
-|---|---|---|
-| VCC / VIN | ESP32 **3V3** | 3.3V only |
-| GND | ESP32 **GND** | Common ground |
-| SDA | ESP32 **GPIO21** | I2C data |
-| SCL | ESP32 **GPIO22** | I2C clock |
-| ADDR (if present) | **GND** (default) | 0x44; float/pull-up → 0x45 |
-
-**Notes:**
-- Firmware tries **0x44 first, then 0x45** — either address works, no config needed.
-- If SHT31 breakout lacks onboard pull-ups, add **4.7kΩ from SDA→3V3** and **4.7kΩ from SCL→3V3**.
-- Most GY-SHT31 modules have onboard 10kΩ pull-ups — fine, do not add more.
-- Keep SDA/SCL wires short (<30cm) or use shielded cable.
-- Only **one** device should be at each address on the bus; if you add more I2C devices, ensure no address clash.
-
-### 3.3 Relay Module (1-channel)
-
-| Relay pin | Connect to | Notes |
-|---|---|---|
-| VCC | ESP32 **5V (VIN)** | Most modules need 5V coil — see note |
-| GND | ESP32 **GND** | **Must** be common with ESP32 GND |
-| IN | ESP32 **GPIO25** | Control signal (3.3V logic) |
-| COM | Load supply (live/hot) | Relay common |
-| NO | Load (pump/valve) | Normally-open — load OFF when relay unpowered |
-| NC | unused | Leave disconnected |
-
-**Notes:**
-
-- **Opto-isolated modules:** Most 5V relay boards have an opto-coupler input. They accept 3.3V logic on IN reliably. VCC **must** be 5V for the coil. GND **must** be shared with ESP32 GND even on opto-isolated boards (the opto LED return is to GND).
-- **Non-isolated modules (SRD-05VDC-SL-C type):** IN threshold ~2.5–3.0V. GPIO25 at 3.3V is marginal but usually works. If the relay chatters or fails to switch, add a 1kΩ pull-up from IN to 5V — **or better, use a logic-level transistor (2N2222 + 1kΩ base resistor) between GPIO25 and IN** for guaranteed switching.
-- **Active level:** The firmware defaults to **active LOW** (most modules: IN=LOW → relay ON). If your module is active HIGH, change "Relay Active Level" to "Active HIGH" in the dashboard Relay tab.
-- **Boot glitch:** The firmware deliberately leaves GPIO25 high-Z until after `loadSettings()`, then sets it OUTPUT + OFF. However, during the ~50ms boot window, GPIO25 floats. If your relay module has **no input pull-up/down**, add a **10kΩ resistor from IN to VCC** (active-LOW modules) or **IN to GND** (active-HIGH modules) to guarantee the relay stays OFF during boot. This is a **hardware** safeguard the firmware cannot provide.
-- **Mains safety:** If switching AC mains (pump/valve), use a properly rated relay (10A @ 250VAC) and enclose it. **Never** work on live mains. Consider a pre-made "IoT relay" or a solid-state relay for pumps with high inrush.
-
-### 3.4 Boot Button
-
-No wiring — the onboard `BOOT` button is tied to **GPIO0** with a 10kΩ pull-up on the DevKit. Firmware uses it for 5-second-hold factory reset.
-
-**Important:** Do **not** hold BOOT during power-on — that enters the ROM download mode and the firmware won't run. The factory reset only works **after** boot (hold ≥5s while running).
-
-### 3.5 Power
-
-| Source | Connect to | Notes |
-|---|---|---|
-| USB 5V | ESP32 micro-USB / USB-C | Simplest — powers ESP32 + 5V pin → relay |
-| External 5V ≥ 1A | ESP32 **5V (VIN)** + GND | Preferred for unattended deployments |
-| 3.3V rail | ESP32 **3V3** | Sensors only — do **not** power relay from 3V3 |
-
-**Power budget:**
-- ESP32 WiFi active: ~240mA peak
-- Relay coil: ~70mA (5V)
-- SHT31: ~1mA
-- Soil sensor: ~5mA
-- **Total: ~320mA peak** — a 5V/1A supply is comfortable, 5V/2A gives headroom.
-
-**Do not** power the relay from the ESP32's 3.3V regulator — it will brown out the ESP32 on relay switching.
+- The soil relay can switch a pump — use a properly rated relay module and keep mains wiring isolated from the ESP32.
+- Do not exceed 3.3 V on GPIO 34 (ADC input).
+- The AP is open by default; always set a password before leaving the device unattended.
