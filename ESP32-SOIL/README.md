@@ -1,104 +1,85 @@
-# 🔌 Complete Wiring Connection Guide
-
-Here's the **complete wiring** for the ESP32 Soil Moisture Monitoring + Relay Control + Web Dashboard system.
-
 <img src="https://github.com/xiv3r/esp32-plant-care/blob/main/ESP32-SOIL/esp32-soil-sensor.png">
----
 
-## 📦 REQUIRED COMPONENTS
+## 1. Hardware Wiring
 
-| # | Component | Quantity |
-|---|---|---|
-| 1 | ESP32 DevKit (30-pin or 38-pin) | 1 |
-| 2 | Soil Moisture Sensor (capacitive or resistive) | 1 |
-| 3 | Relay Module (5V, 1-channel, opto-isolated recommended) | 1 |
-| 4 | Water pump OR solenoid valve (load for relay) | 1 |
-| 5 | External 5V power supply (for relay + pump) | 1 |
-| 6 | Jumper wires (female-female, male-female) | ~10 |
-| 7 | USB cable (for powering ESP32 + programming) | 1 |
-| 8 | Optional: DC barrel jack adapter for pump | 1 |
+| Component | ESP32 Pin | Notes |
+|-----------|-----------|-------|
+| Soil moisture sensor (analog out) | GPIO34 | ADC input only, 3.3V max |
+| Relay module (IN) | GPIO25 | Active level configurable in UI |
+| Buzzer (active) | GPIO26 | Drives HIGH to beep |
+| LED (anode) | GPIO33 | PWM via LEDC, add resistor |
+| OLED SDA | GPIO21 | SSD1306 128x64, I2C addr 0x3C |
+| OLED SCL | GPIO22 | |
+| BOOT button | GPIO0 | Built-in; short press = page, 5s hold = factory reset |
 
----
+Power the sensor and relay from a stable 3.3V/5V supply as required by your modules. Common ground between ESP32 and all modules.
 
----
+## 2. First Boot
 
-## 🔧 DETAILED WIRING
+1. Flash the sketch via Arduino IDE (ESP32 board package, `Adafruit SSD1306` + `Adafruit GFX` libraries installed).
+2. On boot the device creates a WiFi access point:
+   - **SSID:** `ESP32_Soil_Sensor`
+   - **Password:** `12345678`
+3. Connect to that AP, then open **http://192.168.4.1** in a browser. Any other URL redirects there (captive portal).
 
-### 1️⃣ Soil Moisture Sensor → ESP32
+## 3. Initial Calibration (important)
 
-| Sensor Pin | Wire Color (typical) | ESP32 Pin | Notes |
-|---|---|---|---|
-| **VCC / +** | Red | **3V3** | Do NOT use 5V — ESP32 ADC max is 3.3V |
-| **GND / −** | Black | **GND** | Common ground |
-| **AOUT / SIG** | Yellow/Blue | **GPIO34** | ADC1_CH6 (WiFi-safe) |
+1. Insert the sensor in **dry soil**, wait ~10 s, go to **Soil Moisture** page → click **Set Dry = Current Raw**.
+2. Insert in **wet/saturated soil**, wait ~10 s → click **Set Wet = Current Raw**.
+3. Set **Relay ON at or below (%)** (default 35%) and **Hysteresis** (default 5%).
+4. Click **Save Settings**.
 
-**⚠️ Important:** GPIO34 is **input-only** and belongs to **ADC1**, which is safe to use when WiFi is active. Do NOT move to GPIO32/33/35 — those are also OK, but avoid GPIO0/2/4/12–15/25–27 (ADC2) which conflict with WiFi.
+Moisture % = (dry − raw) / (dry − wet) × 100, clamped 0–100.
 
-**Capacitive sensor** (recommended):
-- Output 0–3.0V — perfectly safe
-- Doesn't corrode (no exposed electrodes)
-- More expensive (~$3–5)
+## 4. Relay Logic
 
-**Resistive sensor** (cheap):
-- Output 0–3.3V — safe but borderline
-- Corrodes over time (electrolysis)
-- Cheap (~$1)
+- **Auto mode:** relay turns ON when moisture ≤ threshold, OFF when moisture ≥ threshold + hysteresis.
+- **Min ON / Min OFF times** prevent rapid cycling.
+- **Manual ON / OFF** overrides from the Dashboard buttons or Soil page.
+- Active level (HIGH/LOW) is configurable for both relay types.
 
----
+## 5. Configuring Subsystems
 
-### 2️⃣ Relay Module → ESP32
+| Page | What you can set |
+|------|------------------|
+| **Buzzer** | Enable, trigger (low/high moisture, relay on, periodic), beep/gap ms, count, repeat period |
+| **LED** | Enable, mode (Off/On/Blink/Pattern), brightness 0–255, on/off ms |
+| **OLED** | Enable, current page, auto-rotate interval (0 = manual), contrast |
+| **WiFi AP** | SSID, password (≥8 chars), channel, max clients, hidden, TX power |
+| **System** | Save now, reboot, factory reset, firmware version, stats |
 
-| Relay Pin | Wire Color | ESP32 Pin | Notes |
-|---|---|---|---|
-| **VCC** | Red | **VIN (5V)** | Most relay modules need 5V. Do NOT use 3V3 |
-| **GND** | Black | **GND** | Must be common with ESP32 GND |
-| **IN / SIG** | Yellow | **GPIO25** | Digital output |
+## 6. OLED Pages (6 total)
 
-**⚠️ Important notes:**
+Dashboard → Soil → Buzzer → LED → WiFi → System.  
+Short-press **BOOT** to advance. Set auto-rotate on the OLED page (default 10 s). Hold BOOT 5 s for factory reset (release before 5 s to cancel).
 
-- **5V relay modules** must be powered from **VIN (5V)**, NOT 3V3 — 3.3V may not reliably trigger them.
-- **3.3V-compatible relay modules** exist — those can use 3V3.
-- **Opto-isolated modules** (recommended) protect the ESP32 from back-EMF.
-- **Active-LOW modules** are the most common. The code already accounts for this:
-  ```cpp
-  #define RELAY_ACTIVE_LOW true
-  ```
-  If your relay behaves inverted (ON when should be OFF), change this to `false`.
+## 7. Configuration Persistence
 
-**Relay module pin labels vary:**
-- `VCC` / `+` / `5V`
-- `GND` / `−`
-- `IN` / `SIG` / `S` / `CH1`
+- Settings saved to **dual NVS slots** with CRC32 and sequence numbers (survives power loss; picks newest valid slot).
+- Saves are **debounced (2 s)** and **rate-limited (30 s)** to protect flash.
+- Stats (relay ON time, sample count) auto-save hourly.
+- **Save Config Now** on the System page forces an immediate write.
 
----
+## 8. Recovery & Protections
 
-### 3️⃣ Relay Output Side → Pump/Valve
+- **Watchdog:** 30 s task WDT; device reboots on hang.
+- **Heap guard:** if free heap < 4 KB for 60 s, config is saved and device restarts.
+- **Factory reset:** System page button or 5 s BOOT hold — erases all NVS config and reboots to defaults.
 
-**Wire description:**
-- **COM** (Common) → to **Pump negative (-)**
-- **NO** (Normally Open) → to **Power supply positive (+)**
-- **NC** (Normally Closed) → unused
-- **Pump positive (+)** → to **Power supply positive (+)** directly
+## 9. Reconnecting After WiFi Changes
 
-**Result:** When relay closes (ESP32 drives GPIO25 LOW for active-low), current flows: Power Supply → NO → COM → Pump → Power Supply GND. Pump runs.
+After changing SSID/password/channel, the AP restarts ~1 s later. Reconnect to the new SSID and reopen **http://192.168.4.1**.
 
-**⚠️ Do NOT power the pump from the ESP32's VIN.** Use a **separate 5V/12V supply** rated for the pump's current.
+## 10. Troubleshooting
 
-**⚠️ If using mains AC (110/220V pump):** Use a relay rated for AC, and **never** touch the relay's AC side while powered. Consider using a certified AC relay module with proper terminal blocks and fusing.
-
----
-
----
-
-**Recommended power setup:**
-- **ESP32** powered via USB (5V, 500mA)
-- **Relay + Pump** powered via **external 5V or 12V** supply (rated ≥ pump current + 100mA)
-- **Common GND** between ESP32 and external supply
-
-**If you don't have an external supply:**
-- ESP32's VIN pin can supply **~500mA max** (limited by USB)
-- A small 5V pump (≤ 200mA) might work
-- A 12V pump or larger — **must** use separate supply
+| Symptom | Fix |
+|---------|-----|
+| Moisture always 0% or 100% | Recalibrate dry/wet; check GPIO34 wiring and 3.3V |
+| Relay never switches | Check active level setting; verify min ON/OFF times aren't blocking |
+| No OLED output | Confirm I2C address 0x3C; check SDA/SCL not swapped |
+| Can't reach 192.168.4.1 | Ensure you're connected to the ESP32 AP, not another network |
+| Settings lost after reboot | Was Save clicked? Saves are debounced — use **Save Config Now** |
+| Constant reboots | Check heap/health; verify no short on GPIO25/26/33 |
 
 ---
 
